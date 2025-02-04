@@ -1,4 +1,4 @@
-3## Functional Memory Cells are Derived from Tex Clones
+## Functional Memory Cells are Derived from Tex Clones
 This Resository contains R markdown files needed to generate all figures for our manuscript **Functional memory T cells are derived from exhausted clones and expanded by checkpoint blockade**. We have also included the processed data needed to generate figures. Raw single cell and ATAC-seq data are on NCBI GEO at accession numbers GSE285411 (scRNA/TCR-seq atlas), GSE285412 (scRNA/TCR-seq αPD-L1), GSE285414 (scRNA/TCR-seq post-rechallenge) and GSE285308 (ATAC-seq). Bulk TCR-seq data are available on Zenodo (doi.org/10.5281/zenodo.14648171). This repository was created and is maintained by Colin Raposo he takes responsibility for its contents.
 
 ## Paper Abstract
