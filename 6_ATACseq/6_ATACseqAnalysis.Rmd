@@ -1,0 +1,814 @@
+# ATAC-seq analysis
+
+# laod packages
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ChrAccR)
+  library(DESeq2)
+  library(GenomicRanges)
+  library(chi)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(TxDb.Mmusculus.UCSC.mm10.ensGene)
+  library(ggpubr)
+  library(RColorBrewer)
+  library(MetBrewer)
+  library(ComplexHeatmap)
+  library(cowplot)
+  library(parallel)
+  library(viridis)
+  library(ChIPseeker)
+  library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+  library(ggridges)
+})
+```
+
+# set plot themes
+```{r}
+plot.theme.pca <- theme_bw() + 
+  theme(plot.title = element_text(hjust =  0.5 , size = 14, color = "black"),
+        plot.subtitle = element_text(hjust = 0.5 , size = 10, color = "black"), 
+        axis.text = element_text(color = "black", size = 12),
+        axis.title = element_text(size = 12),
+        axis.ticks = element_line(color = "black", linewidth = 0.7), 
+        strip.background = element_blank(), strip.text = element_text(hjust = 0, size = 11),
+        panel.border = element_rect(colour = "black", linewidth = 0.7), 
+        panel.grid = element_blank()
+        )
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"), 
+                                      strip.background = element_rect(fill = "transparent"), strip.text = element_text(size = 14),)
+
+my.pal <-  c("28 dpi: Tex-Term" = "#8a0000", 
+  "28 dpi: Tex-Int" = "#de311e", 
+  "28 dpi: Tex-KLR" = "#E27E73" ,
+  "28 dpi: Tex-Prog" = "#f285ae" , 
+  "28 dpi: Tex-Prog CD62L+" = "#a0a1d1" , 
+  "100+ dpi: cTem_1" = "#f8a523",
+  "100+ dpi: cTem_2" = "#f6d13a",
+  "100+ dpi: Tex-Prog" ="#a94d9a",
+  "100+ dpi: cTcm" = "#65c7ca", 
+  "cTem_1" = "#f8a523",
+  "cTem_2" = "#f6d13a",
+  "Tex-Prog" ="#a94d9a",
+  "cTcm" = "#65c7ca", 
+  "Arm: aTem" = "#e6af7c",
+  "Arm: aTcm" = "#03509a"
+  )
+```
+
+# get dif peaks function
+```{r}
+getDiffPeaks <- function(dds, dsa, group_name, group1, group2, FDR_cutoff=0.01){
+  coords <- getCoord(dsa, 'peaks')
+  diffPeaks <- results(dds, contrast = c(group_name, group1, group2)) %>% as.data.frame()
+  stopifnot(all((diffPeaks %>% rownames()) == coords@elementMetadata$name))
+  coords@elementMetadata %>% cbind(.,diffPeaks)-> coords@elementMetadata
+  coords <- coords[!is.na(coords$padj)]
+  out.coords <- coords[coords$padj<=FDR_cutoff]
+  return(out.coords[order(out.coords$log2FoldChange, decreasing = T)])
+}
+
+```
+
+# laod DsATAC chromatin accessibility dataset - subset and rename samples 
+```{r}
+#output from Andy's pipeline
+dsa <- loadDsAcc('~/ChronicMemoryGithub_Submission/6_ATACseq/data/pep_atac_output')
+# exuding groups
+## naive was just a control
+## d167 Term - no replicate - stats cannot be calculated
+## 62Lneg from Arm is heterogenous and not very informative
+dsa <- dsa %>% subset(!dsa@sampleAnnot$sampleGroup %in% c("Arm_d167_Naive", "C13_d167_Term", "Arm_d167_62Lneg")) 
+
+# define group names - we called them different things when we did the sequencing versus what the data showed us they are
+name.df <- c("C13_d028_Term" = "28 dpi: Tex-Term",
+  "C13_d028_KLR" = "28 dpi: Tex-KLR" ,
+  "C13_d028_Int" = "28 dpi: Tex-Int" ,
+  "C13_d028_62Lneg" = "28 dpi: Tex-Prog",
+  "C13_d028_62Lpos" =  "28 dpi: Tex-Prog CD62L+",
+  
+  
+  "C13_d167_KLR" =  "100+ dpi: cTem_1",
+  "C13_d167_Int" =  "100+ dpi: cTem_2",
+  "C13_d167_62Lneg" = "100+ dpi: Tex-Prog",
+  "C13_d167_62Lpos" = "100+ dpi: cTcm",
+
+  "Arm_d167_Teff"  = "Arm: aTem",
+  "Arm_d167_62Lpos" = "Arm: aTcm") %>% as.data.frame()
+
+
+oldnames <- rownames(name.df)
+newnames <- name.df$.
+
+# rename samples by group
+dsa@sampleAnnot <- dsa@sampleAnnot %>%
+  mutate(sampleGroup = ifelse(sampleGroup %in% oldnames, newnames[match(sampleGroup, oldnames)], sampleGroup)) %>%
+  mutate(sampleId = paste(sampleGroup, substr(sampleId, 3,3), sep = "_"))
+
+```
+
+# calculate DE-SEQ + var stabilizing + pick out 10,000 most var feature
+```{r}
+# calulate DE_SEQ, + variance stabilizing
+dds <- getDESeq2Dataset(dsa, regionType='peaks', designCols="sampleGroup")
+vst <- vst(dds, blind = F)
+
+# # fetch top 10,000 most variable peaks
+topvarpeaks <- head(order(-rowVars(assay(vst))), 10000)
+
+# calculated PCA top 5000 OCR
+pca <- plotPCA(vst, intgroup= "sampleGroup", ntop=10000)
+
+#  cluster samples by kmeans
+set.seed(123)
+clusters <- kmeans(t(assay(vst)[topvarpeaks,]), centers = 5)
+clusters$cluster
+
+# plot PCA
+pca$data %>% mutate(sampleGroup = factor(sampleGroup, levels = names(my.pal))) %>% 
+  ggplot(aes(x = PC1, y = PC2, fill = sampleGroup)) + 
+    geom_point(size = 4, shape = 21) + 
+      plot.theme.pca +
+      scale_fill_manual(values = my.pal, name = element_blank()) +
+      labs(x = pca$labels[[2]], y = pca$labels[[1]], title = "ATAC-Seq (Top 10,000 Peaks)")
+
+```
+
+# find all peaks and cluster peaks
+```{r}
+ocr_persample_zscore <- assay(vst)[topvarpeaks,] %>% ArchR:::.rowZscores()
+
+set.seed(123)
+kmeans.cluster <- kmeans(ocr_persample_zscore, centers = 4)
+kmeans.cluster$cluster[kmeans.cluster$cluster == "1"] <- "C1: Effector"
+kmeans.cluster$cluster[kmeans.cluster$cluster == "2"] <- "C2: Exhasted"
+kmeans.cluster$cluster[kmeans.cluster$cluster == "3"] <- "C3: Memory-Like"
+kmeans.cluster$cluster[kmeans.cluster$cluster == "4"] <- "C4: Central Memory"
+
+hm.df <- ocr_persample_zscore %>% as.data.frame()
+
+hm.df[hm.df > 2] <- 2
+hm.df[hm.df < -2] <- -2
+
+hm.annot <- columnAnnotation(` ` = dsa@sampleAnnot$sampleGroup, col = list(` ` = my.pal), show_legend = F)
+
+colnames(hm.df) <- c("28dpi_Term_A", "28dpi_Term_B", "28dpi_Term_C",  "28dpi_KLR_A", "28dpi_KLR_B", "28dpi_KLR_C", "28dpi_Int_A", "28dpi_Int_B", "28dpi_Int_C", 
+                     "28dpi_62L+_A", "28dpi_62L+_B", "28dpi_62L+_C", "28dpi_Prog_A",  "28dpi_Prog_B", "28dpi_Prog_C",
+                     "100dpi_cTem1_A", "100dpi_cTem1_B", "100dpi_cTem1_C", "100dpi_cTem2_A", "100dpi_cTem2_B", "100dpi_cTem2_C", 
+                     "100dpi_cTcm_A", "100dpi_cTcm_B", "100dpi_cTcm_C", "100dpi_Prog_A",  "100dpi_Prog_B", "100dpi_Prog_C",
+                     "Arm_aTem_A", "Arm_aTem_B", "Arm_aTem_C", "Arm_aTcm_A", "Arm_aTcm_B", "Arm_aTcm_C"
+                     )
+
+hm <- hm.df %>% Heatmap(name = "Z Score",
+                        show_row_names = F, show_column_names = T, row_title_rot = 0, row_gap = unit(0, "mm"), column_dend_height = unit(8, "mm"),
+                        cluster_columns = T, cluster_rows = F,
+                        col = brewer.pal(9, 'RdYlBu') %>% rev, 
+                        row_split = kmeans.cluster$cluster,
+                        border = T, 
+                        width = unit(6, "in"), height = unit(7, "in"), 
+                        top_annotation = hm.annot, use_raster = T, raster_quality=10
+                        # column_title = paste0(length(rownames(hm.df)), " Peaks")
+                        
+)
+
+hm
+```
+
+# annotate peaks
+```{r}
+## be sure the following packages are loaded: library(ChIPseeker) & library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+annotated_peaks <- vst@rowRanges %>%
+    annotatePeak(tssRegion=c(-3000, 3000),
+                         TxDb=TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb="org.Mm.eg.db", verbose = F) %>% 
+      as.data.frame() 
+    # fitler for only peaks that are plotted and put in same order
+    annotated_peaks <- annotated_peaks %>% filter(name %in% rownames(hm.df)) %>%
+      mutate(name = factor(name, levels = rownames(hm.df))) %>%
+      arrange(name)
+    
+# add cluster to each peak
+annotated_peaks_clusters <- cbind(annotated_peaks, cluster = kmeans.cluster$cluster) %>% 
+  dplyr::select(seqnames, start, end, width, strand, cluster,SYMBOL, geneId, distanceToTSS, annotation)    
+
+# count the number of genes associated wiht peaks in each cluster
+annotated_peaks_clusters_counts <- cbind(annotated_peaks, cluster = kmeans.cluster$cluster) %>% dplyr::count(SYMBOL,  cluster) %>%
+  group_by(cluster) 
+
+annotated_peaks_clusters_counts%>% slice_max(order_by = n, n = 50, with_ties = F) %>%
+  ggplot(aes(y = fct_reorder(SYMBOL, n), x = n)) + geom_col() + facet_wrap(~cluster, scales = "free", ncol = 6)
+
+
+annotated_peaks %>% head()
+```
+
+# print out top peaks for publication
+```{r}
+library(writexl)
+# rename z-scores (raw values, not clipped as we did for heatmap)
+z.scores <- ocr_persample_zscore %>% as.data.frame()
+colnames(z.scores) <- c("28dpi_Term_A", "28dpi_Term_B", "28dpi_Term_C",  "28dpi_KLR_A", "28dpi_KLR_B", "28dpi_KLR_C", "28dpi_Int_A", "28dpi_Int_B",
+                                  "28dpi_Int_C", "28dpi_62L+_A", "28dpi_62L+_B", "28dpi_62L+_C", "28dpi_Prog_A",  "28dpi_Prog_B", "28dpi_Prog_C",
+                                  "100dpi_cTem1_A", "100dpi_cTem1_B", "100dpi_cTem1_C", "100dpi_cTem2_A", "100dpi_cTem2_B", "100dpi_cTem2_C", 
+                                  "100dpi_cTcm_A", "100dpi_cTcm_B", "100dpi_cTcm_C", "100dpi_Prog_A",  "100dpi_Prog_B", "100dpi_Prog_C",
+                                  "Arm_aTem_A", "Arm_aTem_B", "Arm_aTem_C", "Arm_aTcm_A", "Arm_aTcm_B", "Arm_aTcm_C"
+                     )
+
+top1000.var.peaks.table <- cbind(annotated_peaks_clusters %>% rename("seqnames" = "chromosome", "SYMBOL" = "GeneName"),  z.scores)
+head(top1000.var.peaks.table)
+# write_xlsx(top1000.var.peaks.table, path = paste0(outs, "/6C_Top10000VarPeaks.xlsx"))
+
+
+```
+
+# quantify peak accesisibility per cluster / sample 
+```{r}
+
+# rename groups with following DF:
+name.df <- c("C13_d028_Term" = "28 dpi: Tex-Term",
+  "C13_d028_KLR" = "28 dpi: Tex-KLR" ,
+  "C13_d028_Int" = "28 dpi: Tex-Int" ,
+  "C13_d028_62Lneg" = "28 dpi: Tex-Prog",
+  "C13_d028_62Lpos" =  "28 dpi: Tex-Prog CD62L+",
+  
+  
+  "C13_d167_KLR" =  "100+ dpi: cTem_2",
+  "C13_d167_Int" =  "100+ dpi: cTem_1",
+  "C13_d167_62Lneg" = "100+ dpi: Tex-Prog",
+  "C13_d167_62Lpos" = "100+ dpi: cTcm",
+
+  "Arm_d167_Teff"  = "Arm: aTem",
+  "Arm_d167_62Lpos" = "Arm: aTcm") %>% data.frame() 
+name.df <- name.df %>% mutate(sample = rownames(name.df)) %>% rename(. = "newnames")
+
+
+# create new dataframe with ALL peaks from previous chunk + annotate cluster and sample
+plot.df <- data.frame(name = topvarpeaks, assay(vst)[topvarpeaks,])
+
+plot.df <- plot.df %>% mutate(name = rownames(plot.df),
+              cluster = kmeans.cluster$cluster) %>% 
+  pivot_longer(cols = -c(name, cluster), names_to = "sample") %>%
+  separate(sample, into = c("remove1", "LCMV", "Day", "Sort", "remove2", "remove3")) %>% 
+  mutate(sample = paste(LCMV, Day, Sort, sep = "_")) %>% 
+  merge(name.df)
+
+# find median of each peak per group
+plot.df.medians <- plot.df %>% group_by(name, newnames, cluster) %>% summarise(value = median(value))
+  
+# plot peaks per cluster per group 
+
+p1 <- plot.df %>% filter(cluster == c("C1: Effector")) %>% 
+  ggplot(aes(x = log2(value), y = fct_reorder(newnames, value), fill = newnames)) + 
+  geom_density_ridges(show.legend = F) + 
+  plot.theme + facet_wrap(~cluster, ncol = 1, scales = "free") + 
+  scale_fill_manual(values = my.pal) + scale_color_manual(values = my.pal) +
+  scale_y_discrete(expand = expansion(mult = c(0, 0.15))) + scale_x_continuous(expand = expansion(mult = c(0, 0))) +
+  labs(y = element_blank(), x = "ATAC signal (Log2)")
+
+p2 <- plot.df %>% filter(cluster == c("C2: Exhasted")) %>% 
+  ggplot(aes(x = log2(value), y = fct_reorder(newnames, value), fill = newnames)) + 
+  geom_density_ridges(show.legend = F) + 
+  plot.theme + facet_wrap(~cluster, ncol = 1, scales = "free") + 
+  scale_fill_manual(values = my.pal) + scale_color_manual(values = my.pal) +
+  scale_y_discrete(expand = expansion(mult = c(0, 0.15))) + scale_x_continuous(expand = expansion(mult = c(0, 0))) +
+  labs(y = element_blank(), x = "ATAC signal (Log2)")
+
+p3 <- plot.df %>% filter(cluster == c("C3: Memory-Like")) %>% 
+  ggplot(aes(x = log2(value), y = fct_reorder(newnames, value), fill = newnames)) + 
+  geom_density_ridges(show.legend = F) + 
+  plot.theme + facet_wrap(~cluster, ncol = 1, scales = "free") + 
+  scale_fill_manual(values = my.pal) + scale_color_manual(values = my.pal) +
+  scale_y_discrete(expand = expansion(mult = c(0, 0.15))) + scale_x_continuous(expand = expansion(mult = c(0, 0))) +
+  labs(y = element_blank(), x = "ATAC signal (Log2)")
+
+p4 <- plot.df %>% filter(cluster == c("C4: Central Memory")) %>% 
+  ggplot(aes(x = log2(value), y = fct_reorder(newnames, value), fill = newnames)) + 
+  geom_density_ridges(show.legend = F) + 
+  plot.theme + facet_wrap(~cluster, ncol = 1, scales = "free") + 
+  scale_fill_manual(values = my.pal) + scale_color_manual(values = my.pal) +
+  scale_y_discrete(expand = expansion(mult = c(0, 0.15))) + scale_x_continuous(expand = expansion(mult = c(0, 0))) +
+  labs(y = element_blank(), x = "ATAC signal (Log2)")
+
+plot_grid(p1, p2, p3, p4, ncol = 2)
+
+
+
+
+```
+
+# comparison of our data to peaks from abdel-hakeem et al (Nat Immunol 2021 https://www.nature.com/articles/s41590-021-00975-5)
+```{r}
+# create granges object for all peaks in our dataset
+my.peaks.df <- vst@rowRanges %>%
+    annotatePeak(tssRegion=c(-3000, 3000),
+                         TxDb=TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb="org.Mm.eg.db", verbose = F) %>% 
+      as.data.frame() 
+
+my.peaks.gr <-  GRanges(seqnames = Rle(my.peaks.df$seqnames),
+         ranges = IRanges(start = my.peaks.df$start, end = my.peaks.df$end),
+         strand = Rle(my.peaks.df$strand)
+        )
+
+# Directory containing BED files + list BED files
+# data obtained from authors, not included in this Repository project as they are not our data
+bed_dir <- "~/Experiments/CR76_bATACseq_Cl13andArmMem/rawdata/hakeem_bedfiles/" 
+bed_files <- list.files(bed_dir, pattern = "\\.bed$", full.names = TRUE)
+
+# Read each BED file into a GRanges object and store in a list
+hakeem.peaks.gr <- lapply(bed_files, function(file) {
+    gr <- import(file, format = "BED")
+    return(gr)
+})
+
+# Combine GRanges objects into a GRangesList & list
+hakeem.peaks.gr <- GRangesList(hakeem.peaks.gr)
+
+# find overlaps of ourdataset 
+granges_list_overlaps <- lapply(hakeem.peaks.gr, function(gr){
+  overlaps <- findOverlaps(my.peaks.gr, gr)
+  gr2 <- my.peaks.gr[queryHits(overlaps)]
+  return(gr2)
+})
+
+granges_list_overlaps <- GRangesList(granges_list_overlaps)
+names(granges_list_overlaps) <- c("C1_Rec", "C2_Scarred", "C3_Tex", "C4_Mem/Rec", "C5_Mem")
+
+granges_list_overlaps
+
+```
+
+# make a heatmap of peaks overlapping with hakeem dataset
+```{r}
+# collect all peaks from hakeem dataset and put into a single dataset
+all.hakeem.peaks.list <- list(
+  'c1' = granges_list_overlaps$C1_Rec %>% 
+   as.data.frame() %>% 
+    left_join(my.peaks.df %>% dplyr::select(seqnames, start, end, width, strand, name)) %>% 
+    mutate(cluster = "C1: Tex-Rec Specific") ,
+  'c2' = granges_list_overlaps$C2_Scarred %>% 
+   as.data.frame() %>% 
+    left_join(my.peaks.df %>% dplyr::select(seqnames, start, end, width, strand, name)) %>% 
+    mutate(cluster = "C2: Scarred") ,
+  'c3' = granges_list_overlaps$C3_Tex %>% 
+   as.data.frame() %>% 
+    left_join(my.peaks.df %>% dplyr::select(seqnames, start, end, width, strand, name)) %>% 
+    mutate(cluster = "C3: Tex Specific") , 
+  'c4' = granges_list_overlaps$`C4_Mem/Rec` %>% 
+   as.data.frame() %>% 
+    left_join(my.peaks.df %>% dplyr::select(seqnames, start, end, width, strand, name)) %>% 
+    mutate(cluster = "C4: Tmem and Tex-Rec") , 
+  'c5' = granges_list_overlaps$C5_Mem %>% 
+   as.data.frame() %>% 
+    left_join(my.peaks.df %>% dplyr::select(seqnames, start, end, width, strand, name)) %>% 
+    mutate(cluster = "C5: Tmem Specific")
+)
+
+all.hakeem.peaks <- do.call(rbind, all.hakeem.peaks.list) %>% group_by(name) %>% filter(n() == 1)
+
+# annotate peaks
+all.hakeem.peaks.gr <- GRanges(seqnames = Rle(all.hakeem.peaks$seqnames),
+         ranges = IRanges(start = all.hakeem.peaks$start, end = all.hakeem.peaks$end),
+         strand = Rle(all.hakeem.peaks$strand))
+
+all.hakeem.peaks.annot <- all.hakeem.peaks.gr %>%
+  annotatePeak(tssRegion=c(-3000, 3000),
+                         TxDb=TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb="org.Mm.eg.db", verbose = F) %>% as.data.frame() %>%
+  merge(all.hakeem.peaks) 
+
+# select peaks from vst object to get accessibility
+ocr_persample_all_hakeem <- assay(vst)[unique(all.hakeem.peaks$name),] %>% as.data.frame() %>% rownames_to_column("peak") %>%
+  pivot_longer(cols =-peak) %>%
+  separate(name, into = c("remove1", "lcmv", "dpi", "sort", "remove2", "remove3")) %>%
+  dplyr::select(sort, dpi, peak, value, lcmv) %>%
+  # mutate(sort = recode(sort,"KLR" = "cTem_1", "Int" = "cTem_2", "62Lpos" = "cTcm", "62Lneg" = "Tex-Prog")) %>%
+  group_by(sort, peak, dpi, lcmv) %>% summarize(value = median(value)) %>%
+  mutate(group = paste(lcmv, dpi, sort, sep = "_"))  %>% ungroup %>% dplyr::select(-c(sort, dpi,lcmv)) %>%
+  pivot_wider(names_from = group, values_from = value) %>%
+  column_to_rownames("peak")
+
+colnames(ocr_persample_all_hakeem) <- c("28 dpi: Tex-Prog", "100+ dpi: Tex-Prog", "28 dpi: Tex-Prog CD62L+",  "Arm: aTcm", 
+                                        "100+ dpi: cTcm", "28 dpi: Tex-Int",  "100+ dpi: cTem_2", 
+                                    "28 dpi: Tex-KLR", "100+ dpi: cTem_1",  "Arm: aTem",  "28 dpi: Tex-Term" 
+  
+)
+
+head(ocr_persample_all_hakeem)
+
+# calculate z-score and cut off at 2 
+ocr_persample_all_hakeem_zscore <- ocr_persample_all_hakeem %>% as.matrix() %>% ArchR:::.rowZscores() #%>% as.data.frame()
+
+ocr_persample_all_hakeem_zscore[ocr_persample_all_hakeem_zscore > 2] <- 2
+ocr_persample_all_hakeem_zscore[ocr_persample_all_hakeem_zscore < -2] <- -2
+
+# annotations
+subset.annot <- rowAnnotation(` ` = colnames(ocr_persample_all_hakeem_zscore), col = list(` ` = my.pal), show_legend = F)
+
+gene.annot.df <- data.frame(name = rownames(ocr_persample_all_hakeem_zscore)) %>% 
+  left_join(all.hakeem.peaks.annot %>% ungroup()) %>% 
+  mutate(region_name = ifelse(grepl("-", distanceToTSS), paste(SYMBOL, distanceToTSS), paste(SYMBOL, distanceToTSS, sep = " +")))
+annot.positions <- which(gene.annot.df$SYMBOL %in% 
+                           c("Pdcd1", "Tox2", "Id2", "Tigit", "Lef1", "Tcf7", "Il7r"))
+annot.peak <- gene.annot.df[annot.positions,]$region_name
+gene.annot <-  columnAnnotation(foo = anno_mark(at = annot.positions, labels = annot.peak, side = "bottom"))
+
+# plot heatmap
+hm <- ocr_persample_all_hakeem_zscore %>% t %>%
+  Heatmap(show_column_names = F, show_column_dend = F, row_dend_width = unit(0.2, "cm"),
+          # column_title = "Abdel-Hakeem et al: Cluster 1 Regions",
+          col = brewer.pal(9, 'RdYlBu') %>% rev, name = "accessibility", 
+          border = T, 
+          width = unit(24, "cm"), height = unit(5, "cm"), 
+          bottom_annotation = gene.annot,
+          right_annotation = subset.annot, 
+          column_split = gene.annot.df$cluster
+  )
+
+hm
+
+
+
+```
+
+
+# comparison of scarred peaks (C2 from Hakeem dataset)
+```{r}
+# select specifically at scarred peaks 
+scarred.peaks <- granges_list_overlaps$C2_Scarred %>% 
+  as.data.frame() %>% left_join(my.peaks.df %>% dplyr::select(seqnames, start, end, width, strand, name)) %>% 
+  group_by(name) %>% filter(n() == 1)
+
+# annotate scarred peaks
+scarred.peaks.gr <- GRanges(seqnames = Rle(scarred.peaks$seqnames),
+         ranges = IRanges(start = scarred.peaks$start, end = scarred.peaks$end),
+         strand = Rle(scarred.peaks$strand))
+
+scarred.peaks.annot <- scarred.peaks.gr %>%
+  annotatePeak(tssRegion=c(-3000, 3000),
+                         TxDb=TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb="org.Mm.eg.db", verbose = F) %>% as.data.frame() %>%
+  merge(scarred.peaks)
+
+# select peaks from vst object to get accessibility
+ocr_persample_scarred <- assay(vst)[scarred.peaks$name,] %>% as.data.frame() %>% rownames_to_column("peak") %>%
+  pivot_longer(cols =-peak) %>%
+  separate(name, into = c("remove1", "lcmv", "dpi", "sort", "remove2", "remove3")) %>%
+  dplyr::select(sort, dpi, peak, value, lcmv) %>%
+  # mutate(sort = recode(sort,"KLR" = "cTem_1", "Int" = "cTem_2", "62Lpos" = "cTcm", "62Lneg" = "Tex-Prog")) %>%
+  group_by(sort, peak, dpi, lcmv) %>% summarize(value = median(value)) %>%
+  mutate(group = paste(lcmv, dpi, sort, sep = "_"))  %>% ungroup %>% dplyr::select(-c(sort, dpi,lcmv)) %>%
+  pivot_wider(names_from = group, values_from = value) %>%
+  column_to_rownames("peak")
+
+
+colnames(ocr_persample_scarred) <- c("28 dpi: Tex-Prog", "100+ dpi: Tex-Prog", "28 dpi: Tex-Prog CD62L+",  "Arm: aTcm",  "100+ dpi: cTcm", "28 dpi: Tex-Int",  "100+ dpi: cTem_2", 
+                                    "28 dpi: Tex-KLR", "100+ dpi: cTem_1",  "Arm: aTem",  "28 dpi: Tex-Term" 
+  
+)
+
+
+# calculate z-score and cut off at 2 
+ocr_persample_zscore_scarred <- ocr_persample_scarred %>% as.matrix() %>% ArchR:::.rowZscores() #%>% as.data.frame()
+
+ocr_persample_zscore_scarred[ocr_persample_zscore_scarred > 2] <- 2
+ocr_persample_zscore_scarred[ocr_persample_zscore_scarred < -2] <- -2
+
+# detemine peaks more accesibly in given samples
+scarred.peaks.annot.zscore <- ocr_persample_zscore_scarred %>% as.data.frame() %>% rownames_to_column("name") %>% left_join(scarred.peaks.annot)
+
+# heatmap annotations
+avg.acc.annot <- rowAnnotation(`Log2 Accessibility` = anno_density(ocr_persample_scarred %>% log2, width = unit(2, "cm")))
+subset.annot <- rowAnnotation(` ` = colnames(ocr_persample_zscore_scarred), col = list(` ` = my.pal), show_legend = F)
+
+gene.annot.df <- data.frame(name = rownames(ocr_persample_zscore_scarred)) %>% 
+  left_join(scarred.peaks.annot) %>% 
+  mutate(region_name = ifelse(grepl("-", distanceToTSS), paste(SYMBOL, distanceToTSS), paste(SYMBOL, distanceToTSS, sep = " +")))
+annot.positions <- which(gene.annot.df$SYMBOL %in% c("Tox2", "Pdcd1", "Batf", "Cd101", "Jak3", "Lck", "Stat3"))
+annot.peak <- gene.annot.df[annot.positions,]$region_name
+gene.annot <-  columnAnnotation(foo = anno_mark(at = annot.positions, labels = annot.peak, side = "bottom"))
+
+# plot heatmap
+hm <- ocr_persample_zscore_scarred %>% t %>%
+  Heatmap(show_column_names = F, show_column_dend = F, show_row_dend = T, row_names_side = "left", cluster_rows = T, row_dend_side = "right", row_dend_width = unit(0.2, "cm"),
+          column_title = "Abdel-Hakeem et al: Scarred Regions (n=590)",
+          col = brewer.pal(9, 'RdYlBu') %>% rev, name = "accessibility", 
+          border = T, 
+          width = unit(14, "cm"), height = unit(5, "cm"), 
+          right_annotation = avg.acc.annot, left_annotation = subset.annot, bottom_annotation = gene.annot
+          # left_annotation = rowAnnotation(` ` = colnames(ocr_persample_zscore_scarred), col = list(` ` = my.pal), show_legend = F)
+  )
+
+hm
+
+
+```
+
+
+
+# calcualte signgiciantly DAP  vs. Tex-Term
+```{r}
+# get all groups to compare against d28 term -  exclude the first element of the vector because that is d28 term
+groups <- unique(dsa@sampleAnnot$sampleGroup)[-1]# %>% unfactor() 
+
+# get dif peaks by FDR
+# cutoffs - FDR = 0.01, Log2FC cutoff = 1
+dif_peaks_list <- lapply(groups, function(x){
+  granges_object <- getDiffPeaks(dds = dds, dsa = dsa, group_name = "sampleGroup", group1 = x, group2 = "28 dpi: Tex-Term", FDR_cutoff = 0.01) 
+  granges_object@elementMetadata$group <- x
+  granges_object <- subset(granges_object,  log2FoldChange >= 1 | log2FoldChange <= -1) 
+  return(granges_object)
+})
+
+# pull out # of DOCR / group
+dif_peaks_df_list <- lapply(dif_peaks_list, function(x) {
+  x %>% as.data.frame() %>% return()
+})
+
+# plot out total # of DOCR
+plot.df <- do.call(rbind, dif_peaks_df_list)
+
+order <- plot.df %>% dplyr::count(group) %>% arrange(desc(n)) # set order based on TOTAL# of OCR
+
+plot.df %>%
+  mutate(direction = ifelse(log2FoldChange > 0, "Open", "Closed")) %>%
+  dplyr::count(direction, group) %>%
+  mutate(n = n/1000) %>%
+  ggplot(aes(y = fct_reorder(group, n), x = n, fill = group)) + 
+  geom_col(aes(alpha = direction)) +  
+  labs(title = "DAP vs Tex-Term", y = element_blank(), x = "# of DAP (x1000)") +  plot.theme +
+  scale_alpha_manual(values = c(0.7, 1), name = "Direction") + scale_fill_manual(values = my.pal, guide = "none") + theme(legend.position = c(0.6, 0.2)) + 
+  scale_x_continuous(expand = expansion(mult = c(0.0, 0.2))) + 
+  geom_text(data = order, aes(label = n, x = n/1000 + 1.4))
+
+
+# save DAP for publication
+ 
+## fetch annotations
+annotated_peaks_all_dataframe <- vst@rowRanges %>%
+  annotatePeak(tssRegion=c(-3000, 3000),
+                         TxDb=TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb="org.Mm.eg.db", verbose = F) %>% 
+  as.data.frame()  %>%  
+  dplyr::select(seqnames, start, end, strand, SYMBOL, geneId, distanceToTSS)
+
+
+## merge with comaprisons      
+annotated_dap <- plot.df %>% dplyr::select(seqnames, start, end, strand, log2FoldChange, padj, group) %>% arrange(seqnames) %>% 
+  left_join(annotated_peaks_all_dataframe) %>%  rename("seqnames" = "chromosome", "SYMBOL" = "GeneName", "group" = "Comparison")
+
+
+```
+
+# # calcualte signgiciantly DAP  vs. cTcm
+```{r}
+# get all groups to compare against d28 term -  exclude the first element of the vector because that is d28 term
+groups <- unique(dsa@sampleAnnot$sampleGroup)[-8]# %>% unfactor() 
+
+# get dif peaks by FDR
+# cutoffs - FDR = 0.01, Log2FC cutoff = 1
+dif_peaks_list <- lapply(groups, function(x){
+  granges_object <- getDiffPeaks(dds = dds, dsa = dsa, group_name = "sampleGroup", group1 = x, group2 = "100+ dpi: cTcm", FDR_cutoff = 0.01) 
+  granges_object@elementMetadata$group <- x
+  granges_object <- subset(granges_object,  log2FoldChange >= 1 | log2FoldChange <= -1)
+  return(granges_object)
+})
+
+# pull out # of DOCR / group
+dif_peaks_df_list <- lapply(dif_peaks_list, function(x) {
+  x %>% as.data.frame() %>% return()
+})
+
+# plot out total # of DOCR
+plot.df <- do.call(rbind, dif_peaks_df_list)
+
+order <- plot.df %>% dplyr::count(group) %>% arrange(desc(n)) # set order based on TOTAL# of OCR
+
+plot.df %>%
+  mutate(direction = ifelse(log2FoldChange > 0, "Open", "Closed")) %>%
+  dplyr::count(direction, group) %>%
+  mutate(n = n/1000) %>%
+  ggplot(aes(y = fct_reorder(group, n), x = n, fill = group)) + 
+  geom_col(aes(alpha = direction)) +  
+  labs(title = "DAP vs cTcm", y = element_blank(), x = "# of DAP (x1000)") +  plot.theme +
+  scale_alpha_manual(values = c(0.7, 1), name = "Direction") + scale_fill_manual(values = my.pal, guide = "none") + theme(legend.position = c(0.6, 0.2)) + 
+  scale_x_continuous(expand = expansion(mult = c(0.0, 0.2))) + 
+  geom_text(data = order, aes(label = n, x = n/1000 + 1.4))
+
+
+# save DAP for publication
+ 
+## fetch annotations
+annotated_peaks_all_dataframe <- vst@rowRanges %>%
+  annotatePeak(tssRegion=c(-3000, 3000),
+                         TxDb=TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb="org.Mm.eg.db", verbose = F) %>% 
+  as.data.frame()  %>%  
+  dplyr::select(seqnames, start, end, strand, SYMBOL, geneId, distanceToTSS)
+
+## merge with comaprisons      
+annotated_dap <- plot.df %>% dplyr::select(seqnames, start, end, strand, log2FoldChange, padj, group) %>% arrange(seqnames) %>% 
+  left_join(annotated_peaks_all_dataframe) %>%  rename("seqnames" = "chromosome", "SYMBOL" = "GeneName", "group" = "Comparison")
+
+annotated_dap %>% left_join(
+  scarred.peaks %>% dplyr::rename(chromosome = seqnames) %>% mutate(scarred = "scarred")) %>% 
+  mutate(scarred = ifelse(scarred == "scarred", "scarred", "other")) %>%  
+  mutate(direction = ifelse(log2FoldChange > 0, "Open", "Closed")) %>%
+  filter(grepl("100", Comparison), scarred == "scarred") %>%
+  dplyr::count(direction, Comparison, scarred) %>%
+  ggplot(aes(y = fct_reorder(Comparison, n), x = n)) + 
+  geom_col(aes(fill = scarred)) +  
+  labs(title = "DAP vs cTcm", y = element_blank(), x = "# of DAP") +  plot.theme + 
+  facet_grid(~direction)
+  
+```
+
+
+# set up for plotting browser tracks 
+## used a combination of traclkplot and ggplot to have greater capacity to edit the plots in illustrator
+```{r}
+suppressPackageStartupMessages({
+  library(trackplot)
+  library(Seurat)
+  library(Signac)
+})
+
+# need a signac object for making gene annotation plots - needs to be same species, but besides that any signac object will do 
+sig.obj <- read_rds("~/Experiments/CR41_ChronicAndAcuteMemory_scATACseq/analysis_d21vsd160/SignacObjects/5A_scATAC_d21_d160_Integrated.Rds")
+
+# set environment so trackplot finds bwtool
+Sys.setenv(PATH=paste0(Sys.getenv('PATH'),':/home/colin/bin/'))
+
+# load in bigwigs
+bigwig_files <- list.files("~/ChronicMemoryGithub_Submission/6_ATACseq/data/BigWig/output", pattern = "^group", full.names = T)
+
+bigWigs = read_coldata(bws = bigwig_files, build = "mm10")
+
+# use setnames to set bigwig file names
+mapping <- setNames(
+                  # new names
+                       c("exlude01", 
+                        "Arm: aTcm", 
+                        "exlude02", 
+                        "Arm: aTem", 
+                        "28 dpi: Tex-Prog", 
+                        "28 dpi: Tex-Prog CD62L+",
+                        "28 dpi: Tex-Int",
+                        "28 dpi: Tex-KLR", 
+                        "28 dpi: Tex-Term",
+                        "100+ dpi: Tex-Prog",
+                        "100+ dpi: cTcm",
+                        "100+ dpi: cTem_2", 
+                        "100+ dpi: cTem_1", 
+                        "exlude03"),
+                      
+                      
+                    #old names based on file names (substr(7,21))
+                      c("group_Arm_d167_62Lneg_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_Arm_d167_62Lpos_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_Arm_d167_Naive_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_Arm_d167_Teff_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d028_62Lneg_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d028_62Lpos_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d028_Int_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d028_KLR_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d028_Term_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d167_62Lneg_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d167_62Lpos_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d167_Int_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d167_KLR_TileSize-5_NormMethod-ReadsInTSS" , 
+                        "group_C13_d167_Term_TileSize-5_NormMethod-ReadsInTSS" 
+                        ))
+
+
+bigWigs$bw_sample_names <- mapping[bigWigs$bw_sample_names]
+
+# select only samples that have a color and rearrange by pallete order
+bigWigs_subset <- bigWigs[bigWigs$bw_sample_names %in% names(my.pal)] 
+
+bigWigs_subset
+
+# function to plot browser tracks in ggplot
+plot_track <- function(gene, loci) {
+  
+      # extract tracks with trackplot
+      t = track_extract(colData = bigWigs_subset,
+                        loci = loci)
+      # 
+      # # bind all tracks together
+      plot_list <- lapply(names(t$data ), function(name) {
+        df <- t$data [[name]]
+        df$Group <- name
+        df$chrloc <- loci
+        return(df)
+      })
+      
+      plot.df <- do.call(rbind, plot_list) %>%
+        mutate(Group = factor(Group, levels = names(my.pal)))
+      
+      # annotation to show  all peaks within correct chromosome
+      chr <- strsplit(loci, ":")[[1]][1]
+      peaks <- annotated_peaks %>% filter(seqnames == chr) 
+      
+      # limits for plot
+      geneloc <- strsplit(loci, ":")[[1]][2] %>% strsplit("-")
+          min <- geneloc[[1]][1] %>% as.numeric()
+          max <- geneloc[[1]][2] %>% as.numeric()
+      
+
+      # generate track plots
+      p <- plot.df %>% pivot_longer(cols = c(start, end)) %>%
+        ggplot() +
+        geom_rect(data = peaks, aes(xmin = start, xmax = end), ymin = 0, ymax = Inf, show.legend = F, fill = "grey80", alpha = 0.5) + # peak annotation
+        geom_line(show.legend = F, aes(x = value, y = max, color = Group)) +
+        geom_area(show.legend = F, aes(x = value, y = max, fill = Group)) +
+        facet_grid(Group ~  chrloc, switch = "x") +
+        scale_fill_manual(values = my.pal) +scale_color_manual(values = my.pal) +
+        annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf) +
+        scale_x_continuous(limits = c(min, max), expand = expansion(mult = c(0.01, 0.01))) +
+        scale_y_continuous(expand = expansion(mult = c(0.0, 0.05))) +
+        ggtitle(gene) +
+        theme_void() +
+        theme(plot.title = element_text(hjust=0.5, face = "italic"),
+              strip.text.y = element_text(hjust = 0, vjust = 0.3),
+              strip.text.x = element_text(hjust = 1))
+         
+      # add in annotation of gene
+      gene_plot <- AnnotationPlot(
+        object = sig.obj,region = gsub(":", "-", loci)) &
+        #theme_void() &
+        scale_x_continuous(limits = c(min, max), expand = expansion(mult = c(0.01, 0.01))) &
+        scale_y_continuous(limits = c(0.95,1.05)) &
+        theme_void()
+        # theme_bw()
+
+      plot <- plot_grid(p, gene_plot, ncol =1, align = "vh", axis = "lr", rel_heights = c(8,1))
+
+      return(plot)
+
+}
+
+# for TFs and other big genes, use this fucntion with wider gaps
+plot_track2 <- function(gene, loci) {
+  
+      # extract tracks with trackplot
+      t = track_extract(colData = bigWigs_subset,
+                        loci = loci)
+      # 
+      # # bind all tracks together
+      plot_list <- lapply(names(t$data ), function(name) {
+        df <- t$data [[name]]
+        df$Group <- name
+        df$chrloc <- loci
+        return(df)
+      })
+      
+      plot.df <- do.call(rbind, plot_list) %>%
+        mutate(Group = factor(Group, levels = names(my.pal)))
+      
+      # annotation to show  all peaks within correct chromosome
+      chr <- strsplit(loci, ":")[[1]][1]
+      peaks <- annotated_peaks_clusters %>% filter(seqnames == chr) 
+      # limits for plot
+      geneloc <- strsplit(loci, ":")[[1]][2] %>% strsplit("-")
+          min <- geneloc[[1]][1] %>% as.numeric() 
+          max <- geneloc[[1]][2] %>% as.numeric() 
+      
+
+      # generate track plots
+      p <- plot.df %>% pivot_longer(cols = c(start, end)) %>%
+        ggplot() +
+        geom_rect(data = peaks, 
+                  aes(xmin = start-1700, xmax = end+1700), ymin = 0, ymax = Inf, show.legend = F, fill = "grey80", alpha = 0.5) + # peak annotation
+        geom_line(show.legend = F, aes(x = value, y = max, color = Group)) +
+        geom_area(show.legend = F, aes(x = value, y = max, fill = Group)) +
+        facet_grid(Group ~  chrloc, switch = "x") +
+        scale_fill_manual(values = my.pal) +scale_color_manual(values = my.pal) +
+        annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf) +
+        scale_x_continuous(limits = c(min, max), expand = expansion(mult = c(0.01, 0.01))) +
+        scale_y_continuous(expand = expansion(mult = c(0.0, 0.05))) +
+        ggtitle(gene) +
+        theme_void() +
+        theme(plot.title = element_text(hjust=0.5, face = "italic"),
+              strip.text.y = element_text(hjust = 0, vjust = 0.3),
+              strip.text.x = element_text(hjust = 1))
+         
+      # add in annotation of gene
+      gene_plot <- AnnotationPlot(
+        object = sig.obj,region = gsub(":", "-", loci)) &
+        theme_void() &
+        scale_x_continuous(limits = c(min, max), expand = expansion(mult = c(0.01, 0.01))) &
+        scale_y_continuous(limits = c(0.95,1.05)) &
+        theme_void()
+
+      plot <- plot_grid(p, gene_plot, ncol =1, align = "vh", axis = "lr", rel_heights = c(8,1))
+
+      return(plot)
+
+}
+
+```
+
+# plot browser tracks in ggplot
+```{r}
+plot_track(gene = "Pdcd1", loci = "chr1:94036305-94077553")
+plot_track2(gene = "Tox", loci = "chr4:6671353-7035799")
+```
+
+
+

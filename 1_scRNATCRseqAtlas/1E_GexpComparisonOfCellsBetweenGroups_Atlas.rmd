@@ -1,0 +1,347 @@
+# Now, digging a bit deeper into the DEG between groups. 
+## the main question we're seeking to answer here is if chronic Tcm or Tem are more similar to their accute counterparts or Tex
+
+# load common libraries + load SO + set paths
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(ggrepel)
+  library(data.table)
+  library(ComplexHeatmap)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(ggridges)
+  library(writexl)
+})
+
+path <- "~/ChronicMemoryGithub_Submission/1_scRNATCRseqAtlas"
+so <- readRDS(paste0(path, "/data/1D_IntegratedSeuratObject_IDdClusters.rds"))
+
+```
+
+# set plot aesthetics
+```{r}
+# palette
+clusterpal <- c(
+  "Tcm" = "#65c7ca",
+  "Tem_1" = "#f8a523",
+  "Tem_2" = "#f6d13a",
+  "Tex-Term" = "#b31e0e",
+  "Tex-Int" = "#de311e",
+  "Tex-KLR" = "#E27E73",
+  "Tex-ISG" = "#a0a1d1",
+  "Tex-Prog" = "#a94d9a",
+  "Prolif" = "#e6af7c",
+  "Tem" = "#f6d13a"
+  )
+
+
+plot.theme.umap <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5), 
+        axis.text = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "plain")) 
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"))
+
+plot.theme.box <- theme_bw() + 
+  theme(plot.title = element_text(hjust =  0.5 , size = 14, color = "black"),
+        plot.subtitle = element_text(hjust = 0.5 , size = 10, color = "black"), 
+        axis.text = element_text(color = "black", size = 12),
+        axis.title = element_text(size = 12),
+        axis.ticks = element_line(color = "black", linewidth = 0.7), 
+        strip.background = element_blank(), strip.text = element_text(hjust = 0, size = 11),
+        panel.border = element_rect(colour = "black", linewidth = 0.7), 
+        panel.grid = element_blank()
+        )
+
+```
+
+# remove genes function
+```{r}
+#remove TCR genes from VF lists
+remove_genes <- function(features, species, tcr=TRUE, ig=TRUE, cell_cycle=TRUE, mito=TRUE, histone=TRUE, ribosome=TRUE) {
+    print(paste("Before filtering:", length(features), "features"))
+
+    if (species == "human") {
+        if (tcr) {
+            features <- features[!grepl("^TR[ABGD][VDJC]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^IG[HLK][VDJC]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% unlist(cc.genes))]
+        }
+        if (mito) {
+            features <- features[!grepl("^MT-", features)]
+        }
+    }
+    if (species == "mouse") {
+        if (tcr) {
+            features <- features[!grepl("^Tr[abgd][vdjc]", features)]
+        }
+        if (tcr) {
+            features <- features[!grepl("^Tcr[abgd][vdjc]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^Ig[hlk][vdjc]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% stringr::str_to_title(unlist(cc.genes)))]
+        }
+        if (mito) {
+            features <- features[!grepl("^Mt-", features)]
+        }
+      
+       if (histone) {
+            features <- features[!grepl("^Hist", features)]
+       }
+      
+       if (ribosome) {
+            features <- features[!grepl("^Rps", features)]
+       }
+      
+      if (ribosome) {
+        }
+      
+    }
+
+    print(paste("After filtering:", length(features), "features"))
+    
+    return(features)
+}
+```
+
+# check seur obj and set cleaned variable features
+```{r}
+DimPlot(so)
+DefaultAssay(so) <- "integrated"
+VariableFeatures(so) %>% length()
+
+vf.clean <- remove_genes(VariableFeatures(so), 
+                         species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+```
+
+# add Phenotype / Group as an additional metadata column
+```{r}
+so$Group[so$Group == "Cl13 d21-26"] <- "Chronic Cl13"
+so$Group[so$Group == "Cl13 d100+"] <- "Cleared Cl13"
+so$Group[so$Group == "Arm"] <- "Arm"
+
+# add new column for PhenoGroup
+so@meta.data$Pheno_Group <- paste(sep = "__", so$Group, so$cell_cluster)
+
+so@meta.data$Pheno_Group %>% table
+
+```
+
+# PC correlation
+## to look at differences between clusters, we extract PC embeddings, then look at correlations of the top 30 PCs between groups
+```{r}
+library(Hmisc)
+
+pca.df <- data.frame(so@meta.data %>% select(Group, Tet, Pheno_Group, cell_cluster), Embeddings(so, reduction = "pca")) %>% 
+  filter(Pheno_Group %in%c("Arm__Tem_1", "Arm__Tem_2", "Arm__Tcm", 
+                           "Chronic Cl13__Tex-Int" , "Chronic Cl13__Tex-KLR", "Chronic Cl13__Tex-Prog" , "Chronic Cl13__Tex-Term",
+                           "Cleared Cl13__Tcm" ,  "Cleared Cl13__Tex-Prog", "Cleared Cl13__Tex-Term", "Cleared Cl13__Tem_1", "Cleared Cl13__Tem_2"
+                          )) 
+
+# group by PhenoGroup and summarized PCs
+summarized.pcs <- pca.df %>% group_by(Pheno_Group) %>% 
+  dplyr::summarise(across(where(is.numeric), median, na.rm = TRUE))
+
+
+# find correlations across all groups
+cors <- summarized.pcs %>% column_to_rownames("Pheno_Group") %>% t() %>% rcorr() 
+
+# select only correlations of interest
+r.values <- cors$r[1:7,8:12] 
+p.values <- cors$P[1:7,8:12]
+
+sig_matrix <- matrix(" " , nrow = nrow(r.values), ncol = ncol(r.values))
+colnames(sig_matrix) <- colnames(r.values)
+rownames(sig_matrix) <- rownames(r.values)
+
+# correct p values with binferoni 
+sig_matrix[p.values <=  0.05 / p.values %>% length()] <- "*" 
+sig_matrix[p.values <=  0.01 / p.values %>% length()] <- "**" 
+sig_matrix[p.values <=  0.001 / p.values %>% length()] <- "***"
+sig_matrix <- t(sig_matrix)
+
+# rename row and column names
+rownames(r.values) <- gsub(".*__", "", rownames(r.values))
+colnames(r.values) <- gsub(".*__", "", colnames(r.values))
+
+
+# plot
+row.annot <- rowAnnotation(` `  = colnames(r.values), col = list(` ` = clusterpal), show_legend = F)
+col.annot <- columnAnnotation(` `  = rownames(r.values), col = list(` ` = clusterpal), show_legend = F)
+split.vector <-  ifelse(grepl("Arm", rownames(p.values)), "Arm", "Chronic Cl13")
+
+hm.cor <- r.values %>% t %>% Heatmap(
+                      col = viridis(9) , border = T, 
+                      width = unit(7*0.8, "cm"), height = unit(5*0.8, "cm"), name = "Pearson R", 
+                      cluster_rows = T, cluster_columns = T, show_column_dend = F, row_dend_width = unit(0.2, "cm"), row_dend_side = "right",
+                      row_title = "Cleared Cl13 Clusters" , 
+                      row_title_side = "left", column_title_side = "bottom", row_names_side = "left",
+                      left_annotation = row.annot, bottom_annotation = col.annot,
+                      cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sig_matrix[i, j], x, y, gp = gpar(fontsize = 12, col = "white"))},
+                      column_split = split.vector
+                  )
+
+hm.cor
+
+```
+
+# deg between cTcm or cTem with other groups
+```{r}
+# group Tem_1 and Tem_2 together for simplicity
+so$Pheno_Group2 <- gsub("_\\d+$", "", so$Pheno_Group)
+test.list <- c("Arm__Tem", "Arm__Tcm","Chronic Cl13__Tex-Int" , "Chronic Cl13__Tex-KLR", "Chronic Cl13__Tex-Prog" , "Chronic Cl13__Tex-Term")
+
+# Calcualte DEG vs cTcm ================================================================
+
+deg.tcm <- lapply(test.list, function(x){
+
+    ## vector of up cells and down cells
+    cells.up <- subset(so, Pheno_Group2 == "Cleared Cl13__Tcm") %>% colnames()
+    cells.down <- subset(so, Pheno_Group2 == x) %>% colnames()
+    
+    deg <- FindMarkers(object = so, 
+                       ident.1 = cells.up, ident.2 = cells.down, 
+                       logfc.threshold = 0, assay = "RNA", features = vf.clean)
+    
+    deg <- deg %>% mutate(gene = rownames(deg)) %>%
+      mutate(sig = dplyr::if_else(p_val_adj < 0.01 & avg_log2FC > 0.25, "up", "ns")) %>% 
+      mutate(sig = dplyr::if_else(p_val_adj < 0.01 & avg_log2FC < -0.25,  "down", sig)) %>%
+      filter(sig != "ns") %>% 
+      mutate(cluster = x)
+    
+    return(deg)
+
+})
+
+# Calcualte DEG vs cTem ================================================================
+
+deg.tem <- lapply(test.list, function(x){
+
+    ## vector of up cells and down cells
+    cells.up <- subset(so, Pheno_Group2 == "Cleared Cl13__Tem") %>% colnames()
+    cells.down <- subset(so, Pheno_Group2 == x) %>% colnames()
+    
+    deg <- FindMarkers(object = so, 
+                       ident.1 = cells.up, ident.2 = cells.down, 
+                       logfc.threshold = 0, assay = "RNA", features = vf.clean)
+    
+    deg <- deg %>% mutate(gene = rownames(deg)) %>%
+      mutate(sig = dplyr::if_else(p_val_adj < 0.01 & avg_log2FC > 0.25, "up", "ns")) %>% 
+      mutate(sig = dplyr::if_else(p_val_adj < 0.01 & avg_log2FC < -0.25,  "down", sig)) %>%
+      filter(sig != "ns") %>% 
+      mutate(cluster = x)
+    
+    return(deg)
+
+})
+
+# PLOT # of Dif expr. genes ==============================================
+
+plot.df <- do.call(rbind, deg.tcm) %>% separate(cluster, into = c("Group", "Cluster"), sep = "__") %>% 
+  count(sig, Group, Cluster) 
+sum.df <- do.call(rbind, deg.tcm) %>% separate(cluster, into = c("Group", "Cluster"), sep = "__") %>% count(Group, Cluster) 
+
+
+p1 <- plot.df %>%
+  ggplot(aes(x = fct_reorder(paste(Group, Cluster), n), y = n)) + 
+  geom_col(aes(fill = Cluster, alpha = sig), show.legend = F) + 
+  geom_text(data = sum.df, aes(label = n, y = n+34)) +
+  plot.theme + 
+  scale_fill_manual(values = clusterpal) + scale_alpha_manual(values = c(0.6,1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) + 
+  labs(title = "DEG vs cTcm", x = element_blank(), y = "# of DEG") + 
+  rotate_x_text(45)
+
+plot.df <- do.call(rbind, deg.tem) %>% separate(cluster, into = c("Group", "Cluster"), sep = "__") %>% 
+  count(sig, Group, Cluster) 
+sum.df <- do.call(rbind, deg.tem) %>% separate(cluster, into = c("Group", "Cluster"), sep = "__") %>% count(Group, Cluster) 
+
+p2 <-  plot.df %>%
+  ggplot(aes(x = fct_reorder(paste(Group, Cluster), n), y = n)) + 
+  geom_col(aes(fill = Cluster, alpha = sig), show.legend = F) + 
+  geom_text(data = sum.df, aes(label = n, y = n+30)) +
+  plot.theme + 
+  scale_fill_manual(values = clusterpal) + scale_alpha_manual(values = c(0.6,1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) + 
+  labs(title = "DEG vs cTem", x = element_blank(), y = "# of DEG") + 
+  rotate_x_text(45)
+
+plot_grid(p1,p2)
+
+
+```
+
+
+# save tables 
+```{r}
+
+tcm.genes <- do.call(rbind, deg.tcm) 
+tem.genes <- do.call(rbind, deg.tem)  
+
+# tcm.genes %>% filter(sig != "ns") %>% select(gene, avg_log2FC, p_val, p_val_adj, sig, cluster) %>% write_xlsx(paste0(outs, "/2C_DEG_Tcm.xlsx"))
+# tem.genes %>% filter(sig != "ns") %>% select(gene, avg_log2FC, p_val, p_val_adj, sig, cluster) %>% write_xlsx(paste0(outs, "/2C_DEG_Tem.xlsx"))
+```
+
+# add common exhaustion module and plot per group
+```{r}
+# common exh. score
+## use the total score from Daniel Et al Nat Immuno
+common.ex.genes <- read.csv("~/Resources/LCMV atlas tables/LCMV_common_ex_score.csv")$Common_Ex_Module
+common.ex.genes <- common.ex.genes[common.ex.genes %in% vf.clean] %>% list()
+
+DefaultAssay(so) <- "RNA"
+so <- AddModuleScore(so, features = common.ex.genes, name = "CommonExMod", assay = "RNA")
+
+VlnPlot(so, features = "CommonExMod1",  cols = clusterpal, pt.size = 0, sort = "decreasing") & plot.theme & rotate_x_text(45) & NoLegend()
+FeaturePlot(so, features = "CommonExMod1",  cols = viridis(9, option = "magma")) & plot.theme.umap & ggtitle("Exhaustion Module")
+# ggsave("2C - CommonExhModule.png", path = outs, width = 4, height = 3.5)
+# ggsave("2C - CommonExhModule.pdf", path = outs, width = 4, height = 3.5)
+
+# vln split by group
+so@meta.data %>% 
+  filter(Pheno_Group %in%c("Arm__Tcm", "Arm__Tem_1", "Arm__Tem_2",
+                           "Chronic Cl13__Tex-Int" , "Chronic Cl13__Tex-KLR", "Chronic Cl13__Tex-Prog" , "Chronic Cl13__Tex-Term",
+                           "Cleared Cl13__Tcm" ,  "Cleared Cl13__Tex-Prog", "Cleared Cl13__Tex-Term", "Cleared Cl13__Tex-Int", "Cleared Cl13__Tex-KLR",  "Cleared Cl13__Tem_1", "Cleared Cl13__Tem_2"
+                          )) %>%
+  mutate(Group = factor(Group, levels = c("Chronic Cl13", "Cleared Cl13", "Arm"))) %>%
+  ggplot(aes(x = fct_reorder(cell_cluster, CommonExMod1) , y = CommonExMod1, fill = cell_cluster)) + 
+  geom_violin(scale = "width", draw_quantiles = 0.5, show.legend = F, color = "black") + 
+  ggforce::facet_row(vars(Group), scales = 'free', space = 'free') +
+  plot.theme + theme(strip.background = element_blank()) + rotate_x_text(45) + 
+  labs(x = element_blank(), y = "Exhaustion Module") +
+  scale_fill_manual(values = clusterpal) +
+  scale_y_continuous(limits = c(-0.6, 1.5))
+
+# ggsave("2B - CommonExhModule.pdf", path = outs, width = 7, height = 2.8)
+
+# median per sample
+so@meta.data %>% 
+  filter(Pheno_Group %in%c("Arm__Tcm", "Arm__Tem_1", "Arm__Tem_2",
+                           "Chronic Cl13__Tex-Int" , "Chronic Cl13__Tex-KLR", "Chronic Cl13__Tex-Prog" , "Chronic Cl13__Tex-Term",
+                           "Cleared Cl13__Tcm" ,  "Cleared Cl13__Tex-Prog", "Cleared Cl13__Tex-Term", "Cleared Cl13__Tex-Int", "Cleared Cl13__Tex-KLR",  "Cleared Cl13__Tem_1", "Cleared Cl13__Tem_2"
+                          )) %>%
+  mutate(Group = factor(Group, levels = c("Chronic Cl13", "Cleared Cl13", "Arm"))) %>% 
+  group_by(Pheno_Group) %>% summarise(CommonExMod1 = median(CommonExMod1))
+
+
+
+ 
+```
+
+

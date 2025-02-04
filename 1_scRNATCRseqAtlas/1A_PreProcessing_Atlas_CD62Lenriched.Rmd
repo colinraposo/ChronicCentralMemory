@@ -1,0 +1,467 @@
+# Pre-processing for scRNA/TCR-seq of GP33+ cells from different timepoints after LCMV-Cl13 - batch 2 Gp33+ cells split by CD62L
+## pre-processing starts with outs from cellranger - available on Github and GEO (GSE285411)
+## file names and paths match the original IDs use in analysis and will need to be updated to match uploaded IDs
+
+## load common libraries
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(data.table)
+  library(ggpubr)
+})
+```
+
+## set paths for folders containing data and where to output data
+```{r}
+path <- "~/Experiments/CR119_scRNATCR_ChronMem"
+outs <- paste0(path, "/01_FilterMultiseqIntegration/outs")
+```
+
+## helper functions for generating seurat object
+```{r}
+###TCR Helper Functions for Creating Seurat Object
+
+###TCR Helper Functions
+
+# ==== color palettes ====
+# TCR chains captured palette
+tcr_chains_pal <- c("#006080","#008EA0FF", 
+                    "#6BAED6", "#C6DBEF", "#238B45", "#74C476",
+                    "#FF6F00FF", "#C71000FF", "#b8b8b899")
+names(tcr_chains_pal) <- c("ab", "aab", 
+                           "a", "aa", "b", "bb", 
+                           "abb", "aabb", "none")
+
+
+# ==== HELPER FUNCTIONS: SEURAT OBJECT CREATION ====
+
+extract_tcr_chains <- function(tcr_data, aa=TRUE, nt=TRUE) {
+  
+  if (aa) {
+    # check that required cdr3 columns are present
+    if (! "cdr3s_aa" %in% colnames(tcr_data)) {
+      stop("cdr3s_aa column not found in data")
+    }
+    
+    # split cdr3s into individual chains (aa)
+    tcr_data$TRA_aa <- gsub(".*?TRA:(\\w+);*.*", "\\1", tcr_data$cdr3s_aa)
+    tcr_data$TRA_aa[grepl("TRB:", tcr_data$TRA_aa)] <- NA
+    
+    tcr_data$TRA_secondary_aa <- gsub(".*?TRA:.*;TRA:(\\w+).*", "\\1", tcr_data$cdr3s_aa)
+    tcr_data$TRA_secondary_aa[grepl("TR[AB]:", tcr_data$TRA_secondary_aa)] <- NA
+    
+    tcr_data$TRB_aa <- gsub(".*?TRB:(\\w+);*.*", "\\1", tcr_data$cdr3s_aa)
+    tcr_data$TRB_aa[grepl("TRA:", tcr_data$TRB_aa)] <- NA
+    
+    tcr_data$TRB_secondary_aa <- gsub(".*TRB:.*TRB:(\\w+);*.*", "\\1", tcr_data$cdr3s_aa)
+    tcr_data$TRB_secondary_aa[grepl("TR[AB]:", tcr_data$TRB_secondary_aa)] <- NA
+  }
+  
+  if (nt) {
+    # check that required cdr3 columns are present
+    if (! "cdr3s_nt" %in% colnames(tcr_data)) {
+      stop("cdr3s_aa column not found in data")
+    }
+    
+    # split cdr3s into individual chains (nt)
+    tcr_data$TRA_nt <- gsub(".*?TRA:(\\w+);*.*", "\\1", tcr_data$cdr3s_nt)
+    tcr_data$TRA_nt[grepl("TRB:", tcr_data$TRA_nt)] <- NA
+    
+    tcr_data$TRA_secondary_nt <- gsub(".*?TRA:.*;TRA:(\\w+).*", "\\1", tcr_data$cdr3s_nt)
+    tcr_data$TRA_secondary_nt[grepl("TR[AB]:", tcr_data$TRA_secondary_nt)] <- NA
+    
+    tcr_data$TRB_nt <- gsub(".*?TRB:(\\w+);*.*", "\\1", tcr_data$cdr3s_nt)
+    tcr_data$TRB_nt[grepl("TRA:", tcr_data$TRB_nt)] <- NA
+    
+    tcr_data$TRB_secondary_nt <- gsub(".*TRB:.*TRB:(\\w+);*.*", "\\1", tcr_data$cdr3s_nt)
+    tcr_data$TRB_secondary_nt[grepl("TR[AB]:", tcr_data$TRB_secondary_nt)] <- NA
+  }
+  
+  return(tcr_data)
+}
+
+# extract chain combination (i.e. alpha, beta, alpha/beta, alpha/alpha/beta, etc.)
+count_chains <- function(cdr3s_aa) {
+  
+  if (is.na(cdr3s_aa)) {
+    return(NA)
+  }
+  
+  a_count <- stringr::str_count(cdr3s_aa, "TRA:")
+  b_count <- stringr::str_count(cdr3s_aa, "TRB:")
+  
+  chains <- paste(c(rep("a", a_count), rep("b", b_count)), collapse="")
+  
+  return(chains)
+}
+
+# merge cellranger vdj clone annotations with clonotypes
+add_gene_annot <- function(chain, clonotypes, clonotype_annot) {
+  xcols <- c("clonotype_id", paste0(chain, "_aa"))
+  ycols <- c("clonotype_id", "cdr3")
+  
+  clonotypes <- dplyr::left_join(clonotypes, clonotype_annot[,c("clonotype_id", "v_gene", "d_gene", 
+                                                                "j_gene", "c_gene", "cdr3")],
+                                 by = setNames(ycols, xcols)
+  )
+  
+  ncols <- ncol(clonotypes)
+  colnames(clonotypes)[(ncols-3):ncols] <- paste(chain, colnames(clonotypes)[(ncols-3):ncols], sep="_")
+  
+  return(clonotypes)
+}
+
+# calculate proportion of cells with TCR chains captured
+tcr_capture_rate <- function(obj, group_var, facet_var=NULL) {
+  
+  # convert to metadata in case input is seurat data object
+  # enables function to accept either seurat obj, seurat metadata, or other dataframe
+  if(class(obj) == "Seurat") {
+    obj <- obj[[]]
+  }
+  
+  if (is.null(obj$cdr3s_aa)) {
+    print("no cdr3s_aa column")
+    return(NULL)
+  }
+  
+  # check TCR chains captured exists in dataframe
+  # if not, calculate
+  if (! "chains" %in% colnames(obj)) {
+    obj$chains <- sapply(obj$cdr3s_aa, count_chains)
+  }
+  
+  if (!is.null(facet_var)) {
+    groups <- c(group_var, facet_var, "chains")
+  } else {
+    groups <- c(group_var, "chains")
+  }
+  tcr_capture_df <- obj %>% group_by_at(groups) %>% 
+    dplyr::summarize(num_cells=n())
+  
+  tcr_capture_df$chains[is.na(tcr_capture_df$chains)] <- "none"
+  tcr_capture_df$chains <- factor(tcr_capture_df$chains, 
+                                  levels=names(tcr_chains_pal))
+  
+  p <- ggplot(tcr_capture_df, aes_string(x=group_var, y="num_cells", fill="chains")) +
+    geom_bar(stat="identity", position = position_fill(reverse = TRUE)) + 
+    coord_cartesian(expand=F) +
+    scale_fill_manual(values=tcr_chains_pal, na.value="grey", name="TCR chains") +
+    labs(y="Proportion of cells") + 
+    theme_classic() 
+  
+  if (!is.null(facet_var)) {
+    p <- p + facet_grid(as.formula(paste("~", facet_var)), space="free_x", scales="free_x")
+  }
+  
+  res <- list(plot=p, data=tcr_capture_df)
+  return(res)
+}
+```
+
+## generate seurat objects from cell ranger outs
+```{r}
+# create a list of lane IDs for individual 10X reactions 
+## we also did scRNA-seq of Gp276 cells, but those data are not uploaded as we filtered out those lanes prior to integration
+lanes <- c("001_GP33_62Lpos" , "002_GP276_62Lpos", "003_GP33_62Lneg" , "004_GP33_62Lneg", "005_GP33_62Lneg", "006_GP276_62Lneg", "007_GP276_62Lneg", "008_GP276_62Lneg")
+
+# run function that creates a so for each 10X lane - x is the name of the lane
+so.list <- lapply(lanes, function(x){
+
+  # define lane_path for the inidividual lane
+  gex_path <- paste0(path, "/00_CellRangerOuts/cell_ranger_gex/" , x)
+  tcr_path <- paste0(path, "/00_CellRangerOuts/cell_ranger_tcr/" , x)
+  
+  # generate counts matrix
+  counts <- Read10X_h5(paste0(gex_path , "/filtered_feature_bc_matrix.h5"))
+  
+  # Append TCR information to metadata tables
+  tcr_table <- fread(input = paste0(tcr_path, "/filtered_contig_annotations.csv"))
+  
+  clonotype_table <- fread(input = paste0(tcr_path, "/clonotypes.csv"))
+  
+  # definte extract_tcr_chains
+  clonotype_table <- extract_tcr_chains(clonotype_table, aa=TRUE, nt=TRUE)
+  
+  #unique tcrs
+  consensus_table <- unique(tcr_table[,c("raw_clonotype_id", "chain", "cdr3", "cdr3_nt", "v_gene", "d_gene", "j_gene", "c_gene")])
+  colnames(consensus_table)[1] <- "clonotype_id" 
+  
+  # create dataframe with all clonotype information 
+  chains <- c("TRA", "TRB", "TRA_secondary", "TRB_secondary")
+  
+  for (chain in chains) {
+    clonotype_table <- add_gene_annot(chain, clonotype_table, consensus_table)
+  }
+  
+  clonotype_table <- clonotype_table[!duplicated(clonotype_table$clonotype_id)]
+  
+  tcr <- tcr_table[,c("barcode", "raw_clonotype_id")]
+  names(tcr)[names(tcr) == "raw_clonotype_id"] <- "clonotype_id"
+  tcr <- tcr[!duplicated(tcr$barcode), ]
+  #add tcr data to dataframe with all
+  tcr_data <- merge(tcr, clonotype_table, by="clonotype_id", all.x = TRUE)
+  # TCR chains captured
+  tcr_data$chains <- sapply(tcr_data$cdr3s_aa, count_chains)
+  
+  rownames(tcr_data) <- tcr_data$barcode
+  
+  so <- CreateSeuratObject(counts = counts, meta.data = tcr_data)
+  
+  so$orig.ident <- x
+  
+  return(so)
+
+})
+
+so.list
+
+```
+
+# look at TCR capture
+```{r}
+
+tcr.plots <- lapply(so.list, function(x){
+  tcr_capture_res <- tcr_capture_rate(x, group_var = "orig.ident")
+  return(tcr_capture_res$plot + xlab(element_blank()))
+})
+
+do.call(ggarrange , c(tcr.plots, common.legend = T, legend = "right" , ncol = 8))
+
+```
+
+## add percent MT to seurat object
+```{r}
+# add percent mt 
+so.list <- lapply(so.list, function(so){
+  so$percent.mt <- PercentageFeatureSet(so, pattern = "^mt-")
+
+  return(so)
+})
+```
+
+## initial filtering of SO based on MT and features
+```{r}
+# calculate cutoffs for % mito and n feature - based on 2x SD for features and 95%ile for %mito
+nfeature_cutoffs_list <- lapply(so.list, 
+                                function(x) {
+                                  data.frame(orig.ident=unique(x$orig.ident),
+                                             nfeature_min=max(1000, mean(x$nFeature_RNA) - 2*sd(x$nFeature_RNA)),
+                                             nfeature_max=mean(x$nFeature_RNA) + 2*sd(x$nFeature_RNA),
+                                             mito=min(4, quantile(x$percent.mt, 0.95))
+                                            )
+                                })
+nfeature_cutoffs <- do.call(rbind, nfeature_cutoffs_list)
+rownames(nfeature_cutoffs) <- nfeature_cutoffs$orig.ident
+
+nfeature_cutoffs
+
+write.csv(nfeature_cutoffs, file = paste0(outs, "/nfeaturecutoffs.csv"))
+
+# library QC metrics
+qc_metrics_list <- lapply(so.list, 
+                          function(x) x[[c("orig.ident", "nFeature_RNA", "nCount_RNA", "percent.mt", "Phase" , "chains")]])
+
+qc_metrics <- do.call(rbind, qc_metrics_list)
+
+p1 <- ggplot(qc_metrics, aes(x=percent.mt, y = nFeature_RNA))  + 
+  geom_point(size = 0.1) + 
+  stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = F) +
+  facet_wrap(~orig.ident) + scale_x_log10() +
+  scale_fill_viridis(option = "magma") +
+  geom_rect(data = nfeature_cutoffs ,
+           aes(x = mito, xmin = 0, xmax = mito,
+               y = nfeature_min, ymin = nfeature_min,  ymax= nfeature_max),
+           colour="red", lty=2, size=0.5, fill = "transparent")
+
+p3 <- ggplot(qc_metrics, aes(x=percent.mt, y = nFeature_RNA, color = chains))  + 
+  geom_point(size = 0.1) + 
+  #stat_density_2d(aes(fill = ..level..), geom = "polygon", show.legend = F) +
+  facet_wrap(~orig.ident) + scale_x_log10() +
+  scale_color_manual(values=tcr_chains_pal, na.value="grey", name="TCR chains")
+
+plot_grid(p1, p3, ncol = 2)
+
+# ggsave(paste(outs, "nFeature_Cutoffs.pdf" , sep = "/"), width = 12)
+
+# set the tcr combinatios which shouldnt exist
+bad_tcr_combs <- c("aaaab", "aaabb","aaaaab","aaaabb","aaaabbb","aaab", "aaabbb","aabb", "aabbb", "abb", "abbb","aabbbb","abbbb")
+
+# filter seruat objects
+filtered.so.list <- lapply(so.list, function(so) {
+  # define feature cutoffs for particular 10X lane
+  cut_offs <- nfeature_cutoffs %>% subset(orig.ident == so$orig.ident %>% unique) 
+  # define cells to keep 
+  so$keep <- so$nFeature_RNA > cut_offs$nfeature_min & 
+    so$nFeature_RNA < cut_offs$nfeature_max & 
+    so$percent.mt < cut_offs$mito & 
+    (!so$chains %in% bad_tcr_combs) 
+  so.filt <- subset(so, keep==TRUE)
+  return(so.filt)
+})
+
+# check count of cells in each lane
+lapply(filtered.so.list, function(so) {table(so$orig.ident)}) 
+ 
+
+```
+
+## function for demultiplexing with Demultiplex 
+```{r}
+ms.demux <- function(so) {
+  require(deMULTIplex2)
+  require(deMULTIplex)
+
+# create read table ++++++++++
+  # get the sample name out of orig.ident 
+  lane.id <- so$orig.ident %>% substr(0,3) %>% unique()
+  lane.name <- so$orig.ident %>% substr(5,100) %>% unique()
+  name.id.name <- paste(lane.name, lane.id, sep = "_")
+
+  # get fastq file name base
+  files <- list.files(ms.fastq) 
+  ms.file.root <- files[grepl(name.id.name, files)][1] %>% # take first fastq file
+      str_replace("(L\\d{3}).*", "\\1") # remove all text after the L00X number
+
+  read_table <- readTags(dir = ms.fastq,
+                       name = ms.file.root, ### CHANGE THIS
+                       barcode.type = "MULTIseq",
+                       assay = "RNA")
+
+
+# create read matrix
+  tag_mtx <- alignTags(read_table, tag.ref) 
+  
+  cell_ids <- rownames(tag_mtx) %in% substr(rownames(so@meta.data), 1, 16) # choose only cells in so
+  tag_used <- Matrix::colSums(tag_mtx) > 1e4 # Filter for used tags
+  
+  tag_mtx_filtered <- tag_mtx[cell_ids,tag_used]
+
+# barcode classification ++++++++++
+  bar.table <- tag_mtx_filtered %>% data.frame %>% dplyr::select(c(1:nbar))
+  counter <- 0
+  while (counter >= 0) {
+    counter <- counter + 1
+    print(paste("Round ", counter, "...",sep=""))
+    bar.table_sweep.list <- list()
+    n <- 0
+    for (q in seq(0.01, 0.99, by=0.02)) {
+      print(q)
+      n <- n + 1
+      bar.table_sweep.list[[n]] <- classifyCells(bar.table, q=q)
+      names(bar.table_sweep.list)[n] <- paste("q=",q,sep="")
+    }
+    res <- findThresh(call.list=bar.table_sweep.list)
+    calls <- classifyCells(bar.table, q=findQ(res$res, res$extrema))
+    negs <- names(calls)[which(calls == "Negative")]
+    if (length(negs) == 0) { break }
+    if (counter == 1) { neg.cells <- negs }
+    if (counter > 1) { neg.cells <- c(neg.cells, negs) }
+    print(paste(length(which(calls %in% c("Negative","Doublet"))), " Singlets...", sep=""))
+    print(paste(length(which(calls == "Doublet")), " Negatives...", sep=""))
+    print(paste(length(which(calls == "Negative")), " Negatives...", sep=""))
+    bar.table <- bar.table[-which(rownames(bar.table) %in% neg.cells), ]
+  }
+
+  call.table <- data.frame(names(calls), calls)
+  colnames(call.table) <- c("Cell_Barcode", "Call")
+  
+  
+  
+# vsiualization ++++++++++
+  
+  # dim reduction 
+  bar.tsne <- barTSNE(bar.table[,1:nbar]) #these values need to be changed based on how many barcodes you used
+  bar.tsne$Cell_Barcode <- rownames(bar.tsne)
+  
+  # merge together clustering and dim reduction
+  ms.data <- full_join(bar.tsne, call.table, by = "Cell_Barcode")
+
+  
+  # plots
+  tsne <- ms.data %>% ggplot(aes(x = TSNE1, y = TSNE2, color = Call)) + geom_point(size = 0.3)
+  
+  features <- ms.data %>% dplyr::select(-c("Cell_Barcode", "Call")) %>%
+    pivot_longer(cols = !c(TSNE1, TSNE2)) %>%
+    ggplot(aes(x = TSNE1, y = TSNE2, color = value)) + geom_point(size = 0.3) + facet_wrap(~name) + 
+    scale_color_viridis_c()
+  
+  plot_grid(tsne , features, rel_widths = c(2.5,3))
+
+# save export ++++++++++
+  ggsave(path = paste0(outs,"/multiseq"), filename = paste("MultiSeqTSNE_" , unique(so$orig.ident), ".pdf") , height = 5, width = 12)
+  write.csv(ms.data %>% dplyr::select(c(Cell_Barcode, Call)),
+            file = paste0(outs, "/multiseq//MultiSeqCalls_" , unique(so$orig.ident), ".csv"))
+  write.csv(tag_mtx_filtered, file = paste0(outs, "/multiseq/MultiSeqBarTable_" , unique(so$orig.ident), ".csv"))
+
+# add to new SO ++++++++++
+  so <- AddMetaData(object = so, metadata = setNames(ms.data$Call, paste0(ms.data$Cell_Barcode, "-1")), col.name =  "multiseq_class") 
+
+return(so)
+
+}
+
+```
+
+## demux all lanes
+```{r}
+# set up for multiseq demuxing
+bar.ref.full <- read.csv(paste0(path, "/00_CellRangerOuts/C119_Bartable.csv"))  #read in reference
+bar.ref.full
+
+tag.ref <- c(bar.ref.full$Barcode.Seuqence) # pull out just bar codes
+names(tag.ref) <- bar.ref.full$Sample # give names to make demuxing way easier
+# tag.ref <- tag.ref[1:11] # choose only bars that we actually used - change this
+nbar <- length(tag.ref)
+ms.fastq <- paste0(path, "/00_MS_FASTQ/") # path for fastq files
+
+
+# run function to demultiplex
+so.list.demuxed <- filtered.so.list %>% lapply(ms.demux)
+```
+
+## visualize QC metrics
+```{r}
+
+qc_metrix <- lapply(so.list.demuxed, function(x) x[[c("orig.ident", "nFeature_RNA", "nCount_RNA", "percent.mt", "Phase" , "chains", "multiseq_class")]])
+
+qc_metrix <- do.call(rbind, qc_metrix)
+
+# tcr chains
+qc_metrix %>% ggplot(aes(x = multiseq_class, fill = chains)) + 
+  geom_bar() + 
+  facet_wrap(~orig.ident) +
+  rotate_x_text(90) + scale_fill_manual(values = tcr_chains_pal) + 
+  xlab("Multiseq Classification")
+
+
+# % mito and nfeature
+p1 <- qc_metrix %>% ggplot(aes(y = nFeature_RNA, x = multiseq_class)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(size = 0.3, width = 0.2, alpha = 0.5) + 
+  rotate_x_text(45) + xlab("Multiseq Classification")
+
+p2 <-qc_metrix %>% ggplot(aes(y = percent.mt, x = multiseq_class)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(size = 0.3, width = 0.2, alpha = 0.5) + 
+  rotate_x_text(45) + xlab("Multiseq Classification")
+
+ggarrange(p1, p2, common.legend = T, legend  = "right")
+
+ggplot(qc_metrix, aes(x=percent.mt, y = nFeature_RNA))  + 
+  geom_point(size = 0.1, aes(color = multiseq_class)) + 
+  facet_wrap(~orig.ident) 
+
+# vizualize # of cells 
+table(qc_metrix$orig.ident, qc_metrix$multiseq_class)
+```
+
+## save RDS
+```{r}
+saveRDS(so.list.demuxed, file = paste0(path, "/99_seurat_objects/1A_DemuxedSeuratObjectList_batch2.rds"))
+```

@@ -1,0 +1,368 @@
+# Intergration Pipeline within seurat to integrate data from both batched of GP33+ scRNA/TCR-seq at various timepoints after infection
+
+# load common libraries and data
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(data.table)
+  library(ggpubr)
+  library(ComplexHeatmap)
+})
+
+path <- "~/ChronicMemoryGithub_Submission/1_scRNATCRseqAtlas"
+outs <- paste0(path, "/01_FilterMultiseqIntegration/outs")
+
+so.list.cr119 <- read_rds(paste0(path, "/data/1A_DemuxedSeuratObjectList_batch2.rds"))
+so.list.cr082 <- read_rds(paste0(path, "/data/1B_DemuxedSeuratObjectList_batch1.rds"))
+```
+
+# remove genes function
+```{r}
+#remove TCR genes from VF lists
+remove_genes <- function(features, species, tcr=TRUE, ig=TRUE, cell_cycle=TRUE, mito=TRUE, histone=TRUE, ribosome=TRUE) {
+    print(paste("Before filtering:", length(features), "features"))
+
+    if (species == "human") {
+        if (tcr) {
+            features <- features[!grepl("^TR[ABGD][VDJC]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^IG[HLK][VDJC]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% unlist(cc.genes))]
+        }
+        if (mito) {
+            features <- features[!grepl("^MT-", features)]
+        }
+    }
+    if (species == "mouse") {
+        if (tcr) {
+            features <- features[!grepl("^Tr[abgd][vdjc]", features)]
+        }
+        if (tcr) {
+            features <- features[!grepl("^Tcr[abgd][vdjc]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^Ig[hlk][vdjc]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% stringr::str_to_title(unlist(cc.genes)))]
+        }
+        if (mito) {
+            features <- features[!grepl("^Mt-", features)]
+        }
+      
+       if (histone) {
+            features <- features[!grepl("^Hist", features)]
+       }
+      
+       if (ribosome) {
+            features <- features[!grepl("^Rps", features)]
+       }
+      
+      if (ribosome) {
+            features <- features[!grepl("^Rpl", features)]
+        }
+      
+    }
+
+    print(paste("After filtering:", length(features), "features"))
+    
+    return(features)
+}
+```
+
+# rename metadata
+```{r}
+# select only GP33+ cells from batch 1 (CR82) 
+so.list.cr082.gp33 <-  list(so.list.cr082[[1]], so.list.cr082[[2]], so.list.cr082[[3]])
+
+so.list.cr082.gp33 <- so.list.cr082.gp33 %>% lapply(function(so){ 
+ so@meta.data <- so@meta.data %>% mutate(group = paste(orig.ident, multiseq_class, sep = "_")) %>%
+    separate(group, into = c("Tet", "LaneID", "Mouse")) %>%
+    mutate(Tet = substr(Tet, 0,4)) %>%
+    mutate(Sort = "Total") %>%
+    mutate(LCMV = ifelse(grepl( "Chron", Mouse), "Cl13", NA)) %>% mutate(LCMV = ifelse(grepl("Naive", Mouse), "Naive", LCMV)) %>%
+        mutate(LCMV = ifelse(grepl("Acu", Mouse), "Arm", LCMV)) %>%
+    mutate(DPI = ifelse(grepl("Chron", Mouse) & !grepl("ChronMem", Mouse), "d26", NA)) %>% mutate(DPI = ifelse(grepl("ChronMem", Mouse), "d100", DPI)) %>%
+      mutate(DPI = ifelse(grepl("Acu", Mouse), "d69", DPI)) %>%
+    mutate(REP = ifelse(Mouse != "Naive" & Mouse != "Doublet", substr(Mouse, nchar(Mouse), nchar(Mouse)), NA)) %>%
+    mutate(Group = ifelse(LCMV == "Naive", "Naive", paste(LCMV, DPI, Tet, sep = "_"))) %>%
+    mutate(Group = ifelse(LCMV == "Naive", "Naive", paste(LCMV, DPI, Tet, Sort, sep = "_"))) %>% select(-Mouse) %>% select(-LaneID) %>% 
+    mutate(orig.ident = "CR82")
+  return(so)
+  })
+
+# select only gp33+ cells from batch 2
+
+so.list.cr119.gp33 <- list(so.list.cr119[[1]], so.list.cr119[[3]], so.list.cr119[[4]], so.list.cr119[[5]])
+
+so.list.cr119.gp33 <- so.list.cr119.gp33 %>% lapply(function(so){ 
+  so@meta.data <- so@meta.data %>% mutate(group = paste(orig.ident, multiseq_class, sep = "_")) %>% 
+    separate(group, into = c("LaneID", "Tet", "Sort", "LCMV", "DPI", "REP")) %>% 
+    select(-LaneID) %>% 
+    mutate(Group = ifelse(LCMV == "Naive", "Naive", paste(LCMV, DPI, Tet, sep = "_"))) %>%
+    mutate(Group = ifelse(LCMV == "Naive", "Naive", paste(LCMV, DPI, Tet, Sort, sep = "_"))) %>% 
+    mutate(orig.ident = "CR119")
+  return(so)
+  })
+
+# merge everything together into a new list
+so.list <- c(so.list.cr119.gp33[[1]], so.list.cr119.gp33[[2]], so.list.cr119.gp33[[3]], so.list.cr119.gp33[[4]],
+            so.list.cr082.gp33[[1]], so.list.cr082.gp33[[2]], so.list.cr082.gp33[[3]]) 
+
+
+```
+
+# pre-process seurat object
+```{r}
+so.list <- lapply(so.list, function(x) {
+  # remove doublets and unidentified cells from individual so w/in so.list
+  x <- subset(x, !is.na(multiseq_class) & multiseq_class != "Doublet")
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+  return(x)
+})
+```
+
+# integration workflow: reciprocal PCA
+```{r}
+
+## find overlapping features
+### remove TCR genes etc
+features <- SelectIntegrationFeatures(object.list = so.list) %>% 
+  remove_genes(species = "mouse" , tcr=T, ig=F, cell_cycle=F, mito=F, histone=F, ribosome=F)
+
+## PCA run on integration features, not all features
+so.list <- lapply(so.list, FUN = function(x) {
+    x <- ScaleData(x, features = features, verbose = F)
+    x <- RunPCA(x, features = features, verbose = F)
+})
+
+## ID anchors
+anchors <- FindIntegrationAnchors(object.list = so.list, anchor.features = features, reduction = "rpca")#, k.anchor = 5)
+
+## created integrated dataset
+so.rpca <- IntegrateData(anchorset = anchors)
+
+## specify that we will perform downstream analysis on the corrected data note that the
+### original unmodified data still resides in the 'RNA' assay
+DefaultAssay(so.rpca) <- "integrated"
+
+```
+
+# scale data and add cell cycles
+```{r}
+so.rpca <- ScaleData(so.rpca)
+so.rpca <- RunPCA(so.rpca, npcs = 30, features = VariableFeatures(so.rpca)) # variable features were set to the cleaned DEG
+
+# add cell cycle
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+so.rpca <- CellCycleScoring(so.rpca, s.features = s.genes, g2m.features = g2m.genes)
+```
+
+# first pass of clustering
+```{r}
+so.clusters.1 <- RunUMAP(so.rpca, dims = 1:12)
+
+so.clusters.1@meta.data <- so.clusters.1@meta.data %>% 
+  mutate(Group = ifelse(LCMV == "Arm", "Arm", NA)) %>% 
+  mutate(Group = ifelse(LCMV %in% c("Cl13", "Chron") & DPI == "d100", "Cl13 d100+", Group)) %>% 
+  mutate(Group = ifelse(LCMV %in% c("Cl13", "Chron") & DPI != "d100", "Cl13 d21-26", Group)) %>% 
+  mutate(Group = ifelse(LCMV == "Naive", "Naive", Group))
+
+
+DefaultAssay(so.clusters.1) <- "integrated"
+so.clusters.1 <- FindNeighbors(so.clusters.1, dims = 1:12)
+so.clusters.1 <- FindClusters(so.clusters.1,resolution = 0.5)
+
+DimPlot(so.clusters.1, label = T)
+DimPlot(so.clusters.1, split.by = "Group", ncol = 2) & NoAxes()
+
+DefaultAssay(so.clusters.1) <- "RNA"
+FeaturePlot(so.clusters.1, features = c("Klrg1", "Cx3cr1", "Pdcd1", "Tox", "Cd101" , "Tcf7", "Sell", "Cxcr3"), ncol = 4) & NoLegend() & NoAxes()
+DimPlot(so.clusters.1, split.by = "Group", ncol = 2, group.by = "orig.ident", shuffle = T) & NoAxes()
+
+
+FeaturePlot(so.clusters.1, features = c("percent.mt", "nCount_RNA", "nFeature_RNA")) & NoAxes()
+VlnPlot(so.clusters.1, features = c("percent.mt", "nCount_RNA", "nFeature_RNA"))
+DimPlot(so.clusters.1, group.by = "Phase") & NoAxes()
+
+# calculate DEG
+cluster.markers <- FindAllMarkers(so.clusters.1, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", features = features)
+
+# get just the top 5 featurs per cluster
+cluster.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> topgenes
+
+hm.df <- DotPlot(so.clusters.1, features=unique(topgenes$gene))$data[, c("features.plot", "id", "pct.exp", "avg.exp.scaled")]
+## mutate the data bit
+hm.df <- hm.df[,c(1,2,4)] %>% pivot_wider(names_from = id, values_from = avg.exp.scaled)%>% as.data.frame
+rownames(hm.df) <- hm.df$features.plot
+
+## make heatmap
+hm <- hm.df[,-1] %>% 
+  Heatmap(name = "Z-score", # name over the legend
+          col = rev(brewer.pal(9, "RdBu")), # values for the cell values
+          height = unit(16, "in"), width = unit(3, "in"), 
+          show_column_dend = F, show_row_names = T, column_dend_height = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T # do you want the rows and columns to cluster
+        )
+
+# pdf(file = paste0(outs, "/1C_Clusters_1.pdf"), height = unit(18, "in"), width = unit(6, "in"))
+hm
+# dev.off()
+
+DimPlot(so.clusters.1, label = T)
+# ggsave("1C_UMAP_1.pdf", path = outs)
+
+```
+
+
+# second pass of clustering
+## remove junk cells and naive cells
+```{r}
+# set bad clusters
+### c6 = naive
+### c13 = histones
+### c14 = likely doublets -  express KLRG1 and Sell
+### c15 = high mito - high nfeature
+
+so.clusters.1$keep <- "yes"
+so.clusters.1$keep[so.clusters.1$seurat_clusters %in% c("6", "13", "14", "15")] <- "no"
+so.clusters.1$keep[so.clusters.1$multiseq_class == "Naive"] <- "no"
+DimPlot(so.clusters.1, group.by = "keep")
+
+# susbet seurat obj 
+so.clusters.2 <- subset(so.clusters.1, keep == "yes")
+
+# seurat processing
+DefaultAssay(so.clusters.2) <- "integrated"
+so.clusters.2 <- FindVariableFeatures(so.clusters.2)
+
+features.2 <- remove_genes(VariableFeatures(so.clusters.2), 
+                         species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+
+so.clusters.2 <- ScaleData(so.clusters.2, verbose = T)
+so.clusters.2 <- RunPCA(so.clusters.2, npcs = 30, verbose = T, features = features.2)
+
+# clustering & UMAP
+so.clusters.2 <- FindNeighbors(so.clusters.2, dims = 1:12)
+so.clusters.2 <- FindClusters(so.clusters.2,resolution = 0.5)
+so.clusters.2 <- RunUMAP(so.clusters.2, dims = 1:12, return.model = T)
+
+# find DEG
+cluster.markers <- FindAllMarkers(so.clusters.2, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", features = features)
+
+cluster.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> topgenes
+hm.df <- DotPlot(so.clusters.2, features=unique(topgenes$gene))$data[, c("features.plot", "id", "pct.exp", "avg.exp.scaled")]
+hm.df <- hm.df[,c(1,2,4)] %>% pivot_wider(names_from = id, values_from = avg.exp.scaled)%>% as.data.frame
+rownames(hm.df) <- hm.df$features.plot
+
+hm <- hm.df[,-1] %>% 
+  Heatmap(name = "Z-score", # name over the legend
+          col = rev(brewer.pal(9, "RdBu")), # values for the cell values
+          height = unit(16, "in"), width = unit(3, "in"), 
+          show_column_dend = F, show_row_names = T, column_dend_height = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T # do you want the rows and columns to cluster
+        )
+
+# pdf(file = paste0(outs, "/1C_Clusters_2.pdf"), height = unit(18, "in"), width = unit(6, "in"))
+hm
+# dev.off()
+
+DimPlot(so.clusters.2, label = T)
+# ggsave("1C_UMAP_2.pdf", path = outs)
+
+DimPlot(so.clusters.2, split.by = "Group", ncol = 3) & NoAxes()
+
+DefaultAssay(so.clusters.2) <- "RNA"
+FeaturePlot(so.clusters.2, features = c("Klrg1", "Cx3cr1", "Pdcd1", "Tox", "Cd101" , "Tcf7", "Sell", "Cxcr3"), ncol = 4) & NoLegend() & NoAxes()
+VlnPlot(so.clusters.2, features = c("percent.mt", "nCount_RNA", "nFeature_RNA"), pt.size = 0) 
+
+```
+
+# third pass of dataset -  remove junk cells 
+```{r}
+# set bad clusters
+## c11 = high MHC-2
+## c10 = still look naive
+
+so.clusters.2$keep <- "yes"
+so.clusters.2$keep[so.clusters.2$seurat_clusters %in% c("11", "10")] <- "no"
+so.clusters.2$keep[so.clusters.2$multiseq_class == "Naive"] <- "no"
+DimPlot(so.clusters.2, group.by = "keep")
+
+# susbet seurat obj 
+so.clusters.3 <- subset(so.clusters.2, keep == "yes")
+
+# seurat processing
+DefaultAssay(so.clusters.3) <- "integrated"
+so.clusters.3 <- FindVariableFeatures(so.clusters.3)
+
+features.3 <- remove_genes(VariableFeatures(so.clusters.3), 
+                         species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+
+so.clusters.3 <- ScaleData(so.clusters.3, verbose = T)
+so.clusters.3 <- RunPCA(so.clusters.3, npcs = 30, verbose = T, features = features.3)
+
+
+```
+
+# cluster cells with 12 dims
+```{r}
+DefaultAssay(so.clusters.3) <- "integrated"
+
+# clustering & UMAP
+so.clusters.3 <- FindNeighbors(so.clusters.3, dims = 1:12)
+so.clusters.3 <- FindClusters(so.clusters.3,resolution = 0.4)
+so.clusters.3 <- RunUMAP(so.clusters.3, dims = 1:12, return.model = T)
+
+# find DEG
+cluster.markers <- FindAllMarkers(so.clusters.3, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", features = features.3)
+
+cluster.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> topgenes
+hm.df <- DotPlot(so.clusters.3, features=unique(topgenes$gene))$data[, c("features.plot", "id", "pct.exp", "avg.exp.scaled")]
+hm.df <- hm.df[,c(1,2,4)] %>% pivot_wider(names_from = id, values_from = avg.exp.scaled)%>% as.data.frame
+rownames(hm.df) <- hm.df$features.plot
+
+hm <- hm.df[,-1] %>% 
+  Heatmap(name = "Z-score", # name over the legend
+          col = rev(brewer.pal(9, "RdBu")), # values for the cell values
+          height = unit(16, "in"), width = unit(3, "in"), 
+          show_column_dend = F, show_row_names = T, column_dend_height = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T # do you want the rows and columns to cluster
+        )
+
+# pdf(file = paste0(outs, "/1C_Clusters_3.pdf"), height = unit(18, "in"), width = unit(6, "in"))
+hm
+# dev.off()
+
+DimPlot(so.clusters.3, label = T)
+# ggsave("1C_UMAP_3.pdf", path = outs)
+
+DimPlot(so.clusters.3, split.by = "Group", ncol = 3) & NoAxes()
+DimPlot(so.clusters.3, split.by = "Group", group.by = "orig.ident",ncol = 3, shuffle = T) & NoAxes()
+
+DefaultAssay(so.clusters.3) <- "RNA"
+FeaturePlot(so.clusters.3, features = c("Klrg1", "Cx3cr1", "Pdcd1", "Tox", "Cd101" , "Tcf7", "Sell", "Cxcr3"), ncol = 4) & NoLegend() & NoAxes()
+VlnPlot(so.clusters.3, features = c("percent.mt", "nCount_RNA", "nFeature_RNA"), pt.size = 0) 
+```
+
+# save RDS
+```{r}
+saveRDS(so.clusters.3, file = paste0(path, "/99_seurat_objects/1C_IntegratedSeuratObject.rds"))
+```
+

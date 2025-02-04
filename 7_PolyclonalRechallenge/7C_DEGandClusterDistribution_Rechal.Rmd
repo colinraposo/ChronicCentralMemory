@@ -1,0 +1,358 @@
+# Assess DEGs between clusters and look at cluster distribtuion per group
+
+# load common libraries
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(data.table)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  library(readxl)
+  library(writexl)
+})
+```
+
+# load SO + set paths
+```{r}
+path <- "~/ChronicMemoryGithub_Submission/7_PolyclonalRechallenge/data/"
+outs <- paste0(path, "/2_GEX_Analysis/outs")
+
+so <- paste0(path, "7B_SeuratObject_Clustered.rds") %>% readRDS()
+
+```
+
+# set plot themes and color palettes
+```{r}
+plot.theme.umap <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5), 
+        #panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.5, color = "grey80"),
+        axis.text = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "plain")) 
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"))
+
+clusterpal <- c(   
+ 
+  "SLEC_1" = "#014f63",
+  "SLEC_2" = "#62939a",
+  "Eff_Mem" = "#65c7ca",
+  "MPEC" = "#122452",
+  
+  "Exh_Eff" = "#ef8577",
+  "Exh_EM" = "#e62230",
+  "Exh_Term" = "#a11822",
+
+  "Prolif_1" = "#f6d13a",    
+  "Prolif_2" = "#f26e36",   
+  "ISG" = "#e6af7c"
+  )
+```
+
+# remove genes function
+```{r}
+#function to remove TCR genes from VF lists
+remove_genes <- function(features, species, tcr=TRUE, ig=TRUE, cell_cycle=TRUE, mito=TRUE, histone=TRUE, ribosome=TRUE) {
+    print(paste("Before filtering:", length(features), "features"))
+
+    if (species == "human") {
+        if (tcr) {
+            features <- features[!grepl("^TR[ABGD][VDJC]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^IG[HLK][VDJC]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% unlist(cc.genes))]
+        }
+        if (mito) {
+            features <- features[!grepl("^MT-", features)]
+        }
+    }
+    if (species == "mouse") {
+        if (tcr) {
+            features <- features[!grepl("^Tr[abgd][vdjc]", features)]
+        }
+        if (tcr) {
+            features <- features[!grepl("^Tcr[abgd][vdjc]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^Ig[hlk][vdjc]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% stringr::str_to_title(unlist(cc.genes)))]
+        }
+        if (mito) {
+            features <- features[!grepl("^Mt-", features)]
+        }
+      
+       if (histone) {
+            features <- features[!grepl("^Hist", features)]
+       }
+      
+       if (ribosome) {
+            features <- features[!grepl("^Rps", features)]
+       }
+      
+      if (ribosome) {
+            features <- features[!grepl("^Rpl", features)]
+        }
+      
+    }
+
+    print(paste("After filtering:", length(features), "features"))
+    
+    return(features)
+}
+```
+
+# find vf in SO and remove TCR and proliferation / histone / ribosome / mito related genes
+```{r}
+## this was the set of genes used to create PCs for clustering etc
+DefaultAssay(so) <- "integrated"
+vf.clean <- remove_genes(VariableFeatures(so), species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+DefaultAssay(so) <- "RNA"
+```
+
+# ID prolif clusters
+```{r}
+DimPlot(so, label = T)
+
+DimPlot(so, group.by = "Phase") & NoAxes() 
+VlnPlot(so, features = c("S.Score", "G2M.Score"), pt.size = 0)
+```
+
+# find DEG per cluster
+```{r}
+# diferential genes per cluster
+cluster.markers <- FindAllMarkers(so, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", features = vf.clean)
+
+cluster.markers$cell_cluster[cluster.markers$cluster == "0"] <- "SLEC_1"  # Called Teff in the manuscript
+cluster.markers$cell_cluster[cluster.markers$cluster == "1"] <- "Exh_Eff"
+cluster.markers$cell_cluster[cluster.markers$cluster == "2"] <- "Exh_EM" 
+cluster.markers$cell_cluster[cluster.markers$cluster == "3"] <- "SLEC_2"  # Called Teff in the manuscript
+cluster.markers$cell_cluster[cluster.markers$cluster == "4"] <- "Eff_Mem"
+cluster.markers$cell_cluster[cluster.markers$cluster == "5"] <- "Prolif_1"
+cluster.markers$cell_cluster[cluster.markers$cluster == "6"] <- "ISG"
+cluster.markers$cell_cluster[cluster.markers$cluster == "7"] <- "Exh_Term"
+cluster.markers$cell_cluster[cluster.markers$cluster == "8"] <- "Prolif_2"
+cluster.markers$cell_cluster[cluster.markers$cluster == "9"] <- "MPEC"
+
+# write_csv(cluster.markers, file = paste0(outs, "/2C_DegPerCluster.csv"))
+
+
+```
+
+
+# rename clusters
+```{r}
+DimPlot(so, label = T)
+
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "0"] <- "SLEC_1"  # Called Teff in the manuscript
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "1"] <- "Exh_Eff"
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "2"] <- "Exh_EM"
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "3"] <- "SLEC_2"  # Called Teff in the manuscript
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "4"] <- "Eff_Mem"
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "5"] <- "Prolif_1"
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "6"] <- "ISG"
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "7"] <- "Exh_Term"
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "8"] <- "Prolif_2"
+so@meta.data$cell_cluster[so@meta.data$seurat_clusters == "9"] <- "MPEC"
+
+so$cell_cluster <- factor(so$cell_cluster, levels = names(clusterpal))
+Idents(so) <- so$cell_cluster
+DimPlot(so,cols = clusterpal)
+
+```
+
+# dim reduction plots - nicer
+```{r}
+DimPlot(so, cols = clusterpal) + #+ plot.theme.umap + ggtitle(label = "CD8 T cells") 
+  geom_text(data = data.frame(x = 1, y = 2), x = -6, y = -6, label = paste("n =", length(so$barcode), "cells"), size = 4) + 
+  plot.theme.umap 
+
+# dataframe for other UMAP based plots
+umap.df <- data.frame(so@meta.data,  so@reductions$umap@cell.embeddings) %>% 
+  mutate(Group = ifelse(Group == "AcuMem", "Arm:Arm", Group), 
+         Group = ifelse(Group == "ChrMem", "Cl13:Arm", Group),
+         Group = ifelse(Group == "EndoGP33", "Endo GP33+", Group))
+
+# dim recution plots - split by Group =========================
+head(umap.df)
+# vector of groups
+var.list <- c("Arm:Arm" ,"Cl13:Arm", "Endo GP33+") 
+
+plots <- lapply(var.list, function(x) {
+  subset <- umap.df %>% subset(Group == x)
+  umap <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+    ggrastr::geom_point_rast(color = "grey90", size = 0.1, raster.dpi = 600) +
+    ggrastr::geom_point_rast(data = subset, size = 0.1, aes(color = cell_cluster), raster.dpi = 600) + 
+    ggtitle(x) + 
+    scale_color_manual(values = clusterpal)  + plot.theme.umap + NoLegend() 
+  
+   bar <- subset %>% dplyr::count(cell_cluster, Group) %>% mutate(n = n/sum(n)) %>%
+    ggplot(aes(y = n, fill = cell_cluster, x = Group)) + geom_col(show.legend = F) + 
+    plot.theme + 
+    labs(x = element_blank(), y = "Fraction of Cells") + 
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.02)), breaks=c(0, 0.5, 1)) + 
+    scale_fill_manual(values = clusterpal) + coord_flip()
+  
+   plot_grid(umap, bar, rel_heights = c(1, 0.3), ncol = 1) %>% return()
+
+})
+
+do.call(plot_grid, c(plots, ncol = 2))
+
+
+
+# plot out frequencies for all samples
+umap.df %>% count(Group, Tet, Rep, cell_cluster) %>% 
+  mutate(Tet = ifelse(Tet == "GP33pos", "GP33+", "GP33-")) %>%
+  mutate(Mouse = paste(Group, Tet, Rep, sep = "_")) %>% 
+  mutate(Mouse = ifelse(Mouse == "Endo GP33+_GP33+_EndoGP33", "Endo GP33+", Mouse)) %>%
+  group_by(Mouse) %>% mutate(n = n/sum(n)) %>% 
+  ggplot(aes(x = Mouse, y = 100*n, fill = cell_cluster)) + 
+  geom_col(show.legend = F) + 
+  plot.theme + #rotate_x_text(90) +
+  scale_fill_manual(values = clusterpal) + 
+  labs(x = element_blank(), y = "% of Cells") +
+  scale_y_continuous(expand = expansion(mult = c(0.0, 0.05))) + coord_flip()
+
+
+```
+
+# DEG plots
+```{r}
+# feature plots for well charactergorized genes
+feat.plots <- FeaturePlot(so, 
+                          features = c("Pdcd1", "Klrg1", "Cxcr3", "Tcf7"),
+                          # cols =  c("grey", brewer.pal(4, "Reds")[c(2:4)]),
+                          cols =  viridis(n = 9, option = "magma"),
+                          order = T,
+                          ncol = 5, pt.size = 0.01) & plot.theme.umap & NoLegend()
+
+# legend
+feat.legend <- cowplot::get_legend(FeaturePlot(so, features ="Cx3cr1", cols =  viridis(n = 9, option = "magma")))
+
+plot_grid(feat.plots, feat.legend, rel_widths = c(13,1))
+
+# ggsave(filename = "2C - Feature Plots.png", path = outs, height = 2.7, width = 10)
+```
+
+# top genes heatmap
+```{r}
+# get top 5 DEG per cluser
+top5 <- cluster.markers %>% group_by(cluster) %>% slice_max(order_by = avg_log2FC, n = 5, with_ties = F)
+
+hm.df <- DotPlot(so, features = unique(top5$gene))$data %>% 
+  select(c(avg.exp, features.plot, id)) %>% 
+  pivot_wider(names_from = id, values_from = avg.exp) %>% 
+  as.data.frame() %>%  `rownames<-`(.[,1]) %>% select(-features.plot) %>%
+  t() %>% scale()
+
+ha.clust <- rowAnnotation(`Cluster` = rownames(hm.df), 
+                        col = list(`Cluster` = clusterpal),
+                        show_legend = F)
+
+ha.clust
+
+hm.top5 <- hm.df %>% 
+  Heatmap(name = "Z-score", 
+          right_annotation = ha.clust, 
+          col = viridis(n = 9, option = "magma") ,
+          # col = rev(brewer.pal(9, "RdYlBu")),
+          width = unit(7, "in"), height = unit(2.2, "in"), 
+          show_column_dend = F, show_row_names = T, row_dend_width = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T, 
+          border = T
+        )
+
+# pdf(file = paste0(outs, "/2C - HM Top5 DEG per cluster.pdf"), width = unit(12, "in"), height = unit(4, "in"))
+hm.top5
+# dev.off()
+```
+
+# add common exh. module score from Daniel Et al Nat Immuno (https://www.nature.com/articles/s41590-022-01337-5)
+```{r}
+# genes can be found in Supplemental tables of our manuscript
+common.ex.genes <- read.csv("~/Resources/LCMV atlas tables/LCMV_common_ex_score.csv")$Common_Ex_Module
+common.ex.genes <- common.ex.genes[common.ex.genes %in% vf.clean] %>% list()
+
+DefaultAssay(so) <- "RNA"
+so <- AddModuleScore(so, features = common.ex.genes, name = "CommonExMod", assay = "RNA")
+
+VlnPlot(so, features = "CommonExMod1",  cols = clusterpal, pt.size = 0, sort = "decreasing") & plot.theme & rotate_x_text(45) & NoLegend()
+FeaturePlot(so, features = "CommonExMod1")
+
+common.ex.genes[[1]]
+
+# heatmap of common Exh Genes
+hm.df <- DotPlot(so, features = common.ex.genes[[1]])$data %>% 
+  select(c(avg.exp, features.plot, id)) %>% 
+  pivot_wider(names_from = id, values_from = avg.exp) %>% 
+  as.data.frame() %>%  `rownames<-`(.[,1]) %>% select(-features.plot) %>%
+  t() %>% scale()
+
+ha.clust <- columnAnnotation(`Cluster` = rownames(hm.df), 
+                        col = list(`Cluster` = clusterpal),
+                        show_legend = F)
+
+hm.df %>% t%>% 
+  Heatmap(name = "Z-score", 
+          top_annotation = ha.clust, 
+          col = rev(brewer.pal(9, "RdYlBu")),
+          width = unit(2, "in"), height = unit(4.7, "in"), 
+          show_column_dend = F, show_row_names = T, row_dend_width = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T, 
+          border = T
+        )
+```
+
+# also add module scores for Tex-Term, Teff, Tmem from  Daniel Et al Nat Immuno
+```{r}
+# read in genes from module scores (Daniel et al Table S1)
+## we only use the effector module in our analysis - see our table S7
+genes.tables <- read_xls("~/Resources/LCMV atlas tables/Supplemental Table 1.xls") 
+
+# take top 50 genes fgrom each 
+term.genes <- genes.tables %>% filter(cluster == "Texterm") %>% slice_max(n = 50, order_by = avg_log2FC) %>% select(gene) %>% c() 
+mem.genes <- genes.tables %>% filter(cluster == "Tmem") %>% slice_max(n = 50, order_by = avg_log2FC) %>% select(gene) %>% c() 
+eff.genes <- genes.tables %>% filter(cluster == "Teff") %>% slice_max(n = 50, order_by = avg_log2FC) %>% select(gene) %>% c() 
+
+# filter gby 
+module.lists <- list(
+  "Term_Module" = term.genes$gene[term.genes$gene %in% vf.clean],
+  "Mem_Module" = mem.genes$gene[mem.genes$gene %in% vf.clean],
+  "Teff_Module" = eff.genes$gene[eff.genes$gene %in% vf.clean]
+)
+
+so <- AddModuleScore(so, features = module.lists, name = names(module.lists), replace = T, assay = "RNA")
+
+# plot out Moldule scores
+VlnPlot(so, features = c("Term_Module1", "Mem_Module2", "Teff_Module3"),  cols = clusterpal, pt.size = 0, sort = "decreasing", ncol = 3) & 
+  plot.theme & rotate_x_text(90) & NoLegend()
+# ggsave(filename = "2B - ModuleScoreVlns.pdf", path = outs, height = 9, width = 3)
+
+# print out mopdules
+print("Tmem")
+module.lists$Mem_Module
+print("Teff")
+module.lists$Teff_Module
+print("Tex")
+module.lists$Term_Module
+
+```
+
+# after adding module scores, save RDS
+```{r}
+# saveRDS(so, file = paste0(path, "/seurat_objects/7C_SeuratObject_ClusteredAndIDd.rds"))
+```
+
+

@@ -1,0 +1,422 @@
+# in this experiment we longtidunally track clones from the blood at 21 dpi to 100+ dpi in the spleen
+## this data was generated alongside anti-PDL1 clone tracing data (section 9), but we're focusing only on the control (PBS treated) group for this experiment
+
+## load libraries for
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(ComplexHeatmap)
+  library(cowplot)
+  library(ggpubr)
+  library(readxl)
+  library(RColorBrewer)
+  library(MetBrewer)
+  library(ggsankey)
+  library(viridis)
+  library(Hmisc)
+  library(emmeans)
+})
+```
+
+## set directories and plot aesthetics
+```{r}
+path <- "/Users/craposo/Desktop/Github Upload/5_LongitudinalTCRseq"
+
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"), 
+                                      strip.background = element_rect(fill = "transparent"), strip.text = element_text(size = 14)
+                                      )
+
+pop.pal <-  c(
+  "Tcm" = "#65c7ca", 
+  "Tex-KLR" = "#E27E73" ,
+  "Tex-Int" = "#de311e", 
+  "Tex-Term" = "#b31e0e", 
+  "Tex-Prog" = "#a94d9a",
+  "Tem_1" = "#f8a523",
+  "Tem_2" = "#f6d13a", 
+  
+  "d100_Tcm" = "#65c7ca", 
+  "d100_Tex-Term" = "#b31e0e", 
+  "d100_Tex-Prog" = "#a94d9a",
+  "d100_Tem_1" = "#f8a523",
+  "d100_Tem_2" = "#f6d13a", 
+  
+  "d021_Tex-Int" = "#de311e", 
+  "d021_Tex-KLR" = "#E27E73", 
+  "d021_Tex-Prog" = "#a94d9a"
+  
+
+  )
+
+cluster.pal <- c(
+  "Divergent" = "#e6af7c", 
+  "Tcm Bias" = "#65c7ca",
+  "Tem_1 Bias" = "#f8a523",
+  "Tem_2 Bias" = "#f6d13a", 
+  "Tex-Prog Bias" = "#a94d9a", 
+  "Tex-Term Bias" = "#b31e0e", 
+  "Tex-KLR Bias" = "#E27E73" ,
+  "Tex-Int Bias" = "#de311e"
+)
+
+
+```
+
+# import bTCR-seq data
+```{r}
+# Specify the directory path and get all files in the directory
+bTCR_datapath <- paste0(path, "/data/rawdata")
+bTCR_datapath
+
+samples <- list.files(path = bTCR_datapath)
+
+
+# read in all csvs and append sample ID
+bTCR_raw_list <- lapply(samples, function(x){
+  sample.id <- substr(x, 27, 32)
+  path <- paste0(bTCR_datapath, "/TCRlongtiduinal_Processed_" , sample.id , "_pep.csv")
+  data <- read.csv(path)
+  data$Sample.id <- sample.id
+  return(data)
+}) 
+  
+
+# append all TCR raw data together
+bTCR_rawdata <-  do.call(rbind, bTCR_raw_list)
+
+# read in sample IDs and append to bTCR_rawdata
+sample.id <- read.csv(paste0(path, "/data/SampleInfo.csv")) %>% select(Sample, Sample.id)
+
+bTCR_rawdata <- merge(bTCR_rawdata, sample.id, by = "Sample.id") %>% 
+  mutate(CDR3.nuc.= toupper(CDR3.nuc.)) # make CDR3 all upper case to make futures things easier
+
+# select only the samples that we want for analysis
+bTCR_rawdata <- test <- bTCR_rawdata %>% filter(grepl("Ctrl", Sample), !grepl("d35", Sample))
+
+bTCR_rawdata$Sample %>% table
+bTCR_rawdata %>% head()
+
+# select only the cdr3 and count columns
+cdr3.df <- bTCR_rawdata %>% select(CDR3.nuc. , copy, Sample) %>%
+  mutate(Rep = ifelse(substr(Sample , nchar(Sample) -1, nchar(Sample)) == "_r", "R2", "R1")) %>%  # add replicate column
+  mutate(Sample = ifelse(Rep == "R2", substr(Sample, 1, nchar(Sample) -2), Sample))  # remove replicate from sample ID
+```
+
+# check qc and average the bTCR-seq data across technical replicates
+```{r}
+# QC check on replicate samples
+## everything looks highly concordant between replicates
+cdr3.df %>% pivot_wider(id_cols = c(CDR3.nuc. , Sample), values_from = copy, names_from = Rep, values_fn = {sum}) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) %>%
+  ggplot(aes(x = R1, y = R2)) + 
+    geom_point(alpha = .5, size = 0.5) + 
+    geom_smooth(method = "lm", color = "red", fill = "transparent") +
+    facet_wrap(~Sample, scales = "free") + 
+    stat_cor() + scale_x_log10() + scale_y_log10() + theme_bw() + ggtitle("all clones")
+
+# average clone clounts across replicates
+## make vector only where clone is in both replicates
+both.rep.clones <- cdr3.df %>% pivot_wider(id_cols = c(CDR3.nuc. , Sample), values_from = copy, names_from = Rep, values_fn = {sum}) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) %>% 
+  filter(R1 >0, R2 > 0) %>% 
+  select(CDR3.nuc.) %>% c()
+
+## create new clone.df with average reads per sample
+clone.df <- cdr3.df %>% filter(CDR3.nuc. %in% both.rep.clones$CDR3.nuc.) %>% # remove postive control, select only shared clones
+  group_by(Rep, Sample, CDR3.nuc.) %>% mutate(ReadFrac = sum (copy)) %>% ungroup() %>% # any TCRs with the same CDR3 add together
+  group_by(Rep, Sample) %>% mutate(ReadFrac = copy / sum (copy)) %>% # convert copies to fraction of reads
+  ungroup() %>% group_by(Sample, CDR3.nuc.) %>% select(-c(Rep, copy)) %>% summarise(ReadFrac = mean(ReadFrac)) %>% # average read fraction between the two reads
+  dplyr::rename(TRB_CDR3 = "CDR3.nuc.")
+
+# add in cell numbers from sort - adjust the read fractions to cell # of population 
+sampleinfo <- read_xlsx(paste0(path, "/data/CellNumbersSorted.xlsx")) %>%
+  mutate(Sample = str_replace_all(Sample, " ", "_")) %>% select("Sample", "ActualCellNumbner_FlowData", "SortedCellNumber") %>%
+  dplyr::rename(TotalCellNumber = "ActualCellNumbner_FlowData")
+
+clone.df <- merge(clone.df, sampleinfo, by = "Sample") %>% 
+  mutate(Count = ReadFrac * TotalCellNumber) %>% # count is based on total # of cells in population (based on counting beads)
+  mutate(Count_Sort = ReadFrac * SortedCellNumber) %>% # count is based on total # of cells sorted from population (based on sorter #)
+  ungroup()
+
+
+# mutate sample ID into more useful metadata and rename the samples
+## add total clone size and group into TCR
+clone.df.pheno <- clone.df %>% 
+  separate(Sample, into = c('experiment', 'dpi', 'group', 'sort')) %>% 
+  group_by(TRB_CDR3, dpi, group) %>% mutate(CloneSize = sum(Count)) %>% mutate(CloneSize_Sort = sum(Count_Sort))%>% ungroup() %>% # 
+  mutate(sort = ifelse(sort == 'cTcm', 'Tcm', paste0("Tex-", sort)), 
+          sort = ifelse(sort == 'Tex-Int' & dpi == "d100", 'Tem_2', sort),
+          sort = ifelse(sort == 'Tex-KLR'& dpi == "d100", 'Tem_1', sort))
+
+
+# check correlation of clone size based on sorted counts and total counts
+clone.df.pheno %>% ggplot(aes(x = CloneSize_Sort, y = CloneSize)) + geom_point() + 
+  scale_y_log10() + scale_x_log10() + stat_cor()
+
+
+
+```
+# select clones that are shared between between timepoints
+```{r}
+# select clones shared between TP - isolate clones with >5 sorted cells at both timepoints
+d21.clones <- clone.df.pheno %>% filter(CloneSize_Sort > 5, dpi == "d21", group == "Ctrl")
+d100.clones <- clone.df.pheno %>% filter(CloneSize_Sort > 5, dpi == "d100", group == "Ctrl")
+clones.of.interest <- intersect(d21.clones$TRB_CDR3, d100.clones$TRB_CDR3) 
+
+# check number of clones of clones
+make_comb_mat(list("d21" = d21.clones$TRB_CDR3, "d100+" = d100.clones$TRB_CDR3))%>% UpSet()
+
+d21.clones$TRB_CDR3 %>% unique() %>% length()
+
+# filter clones based on only those shared
+ctrl.df <- clone.df.pheno %>% filter(group == "Ctrl", dpi %in% c("d21", "d100"), TRB_CDR3 %in% clones.of.interest)
+
+# clone size cor over time
+ctrl.df %>% group_by(dpi, TRB_CDR3) %>% summarise(Count = sum(Count)) %>% pivot_wider(names_from = dpi, values_from = Count, values_fill = 0) %>% 
+  ggplot(aes(x = d21, y = d100)) + geom_point() + geom_smooth(method = "lm", color = "red") + stat_cor()
+```
+
+# define clone behaviors at day 100 by kmeans clustering
+```{r}
+## subset clones of interest at 100 dpi
+d100.df <- clone.df.pheno %>% filter(dpi  == "d100", TRB_CDR3 %in% clones.of.interest)
+
+# clonal clustering of clones
+d100.wide <- d100.df %>% mutate(freq = Count/CloneSize) %>% select(sort, TRB_CDR3, freq, CloneSize, group) %>% 
+  pivot_wider(values_from = freq, names_from = sort, id_cols = c(CloneSize, TRB_CDR3, group)) %>%
+  mutate(across(everything(), ~replace_na(.x, 0))) 
+
+set.seed(12)
+clusters <- d100.wide %>% select(-c(TRB_CDR3, CloneSize, group)) %>% kmeans(centers = 7)
+d100.wide$cluster <- paste0("C", clusters$cluster)
+
+# add cluster based solely on kmeans
+d100.wide$cluster[clusters$cluster == "1"] <- "Tex-Prog Bias"
+d100.wide$cluster[clusters$cluster == "2"] <- "Tem_2 Bias"
+d100.wide$cluster[clusters$cluster == "3"] <- "Tem_1 Bias"
+d100.wide$cluster[clusters$cluster == "4"] <- "Divergent"
+d100.wide$cluster[clusters$cluster == "5"] <- "Tex-Term Bias"
+d100.wide$cluster[clusters$cluster == "6"] <- "Tem_1 Bias"
+d100.wide$cluster[clusters$cluster == "7"] <- "Tcm Bias"
+
+# heatmap of clones
+right.annot <- rowAnnotation(size = anno_barplot(d100.wide$CloneSize %>% log2))
+
+top.annot <- columnAnnotation(" " = select(d100.wide, -c(TRB_CDR3, CloneSize, cluster, group)) %>% colnames(), 
+                              col = list(" " = pop.pal), 
+                              show_legend = F)
+
+d100.wide %>% ungroup %>% select(-c(TRB_CDR3, CloneSize, cluster, group)) %>% 
+  Heatmap(name = "Frac of Clone", col = brewer.pal(9, "Purples"), 
+        split = d100.wide$cluster,
+        border = T, row_title_rot = 0, cluster_rows = F,
+        width = unit(5*0.6, "cm"), height = unit(6, "cm"), column_dend_height = unit(0.2, "cm"),
+        right_annotation = right.annot, top_annotation = top.annot
+        )
+```
+
+# define clone behaviors at day 21 by kmeans clustering
+```{r}
+## subset clones of interest at 21 dpi
+d021.df <- clone.df.pheno %>% filter(dpi  == "d21", TRB_CDR3 %in% clones.of.interest)
+
+# clonal clustering of clones
+d021.wide <- d021.df %>% mutate(freq = Count/CloneSize) %>% select(sort, TRB_CDR3, freq, CloneSize, group) %>% 
+  pivot_wider(values_from = freq, names_from = sort, id_cols = c(CloneSize, TRB_CDR3, group)) %>%
+  mutate(across(everything(), ~replace_na(.x, 0))) %>% 
+  mutate(group = factor(group, levels = c("Ctrl", "aPDL1"))) 
+
+
+
+set.seed(12)
+clusters <- d021.wide %>% select(-c(TRB_CDR3, CloneSize, group)) %>% kmeans(centers = 4)
+
+d021.wide$cluster[clusters$cluster == "4"] <- "Tex-Int Bias"
+d021.wide$cluster[clusters$cluster == "3"] <- "Divergent"
+d021.wide$cluster[clusters$cluster == "2"] <- "Tex-Prog Bias"
+d021.wide$cluster[clusters$cluster == "1"] <- "Tex-KLR Bias"
+
+# heatmap of clones
+right.annot <- rowAnnotation(size = anno_barplot(d021.wide$CloneSize %>% log2))
+
+top.annot <- columnAnnotation(" " = select(d021.wide, `Tex-Int`, `Tex-KLR`, `Tex-Prog`) %>% colnames(), 
+                              col = list(" " = pop.pal), 
+                              show_legend = F)
+
+d021.wide %>% ungroup %>% select(-c(TRB_CDR3, CloneSize, cluster, group)) %>% 
+  Heatmap(name = "Frac of Clone", col = brewer.pal(9, "Purples"), 
+        split = d021.wide$cluster,
+        border = T, row_title_rot = 0, cluster_rows = T,
+        width = unit(3*0.6, "cm"), height = unit(6, "cm"), column_dend_height = unit(0.2, "cm"),
+        right_annotation = right.annot,
+        top_annotation = top.annot
+        )
+```
+
+# merge together data for shared clones at d21 and d100
+```{r}
+# merge day21 and day100 data
+longitudinal.df <- merge(
+  d021.wide %>% select('TRB_CDR3', 'Tex-Int', 'Tex-KLR', 'Tex-Prog', 'cluster') %>%
+    dplyr::rename('d021_Tex-Int' = 'Tex-Int', 'd021_Tex-KLR' = 'Tex-KLR', 'd021_Tex-Prog' = 'Tex-Prog', '21dpi' = 'cluster'),
+  d100.wide %>% select('TRB_CDR3', 'Tcm', 'Tem_2', 'Tex-Prog', "Tex-Term", "Tem_1", 'cluster') %>%
+    dplyr::rename('d100_Tcm' = 'Tcm', 'd100_Tem_2' = 'Tem_2', 'd100_Tex-Prog' = 'Tex-Prog', 'd100_Tem_1' = 'Tem_1', 'd100_Tex-Term' = 'Tex-Term', '100dpi' = 'cluster')
+  ) %>% 
+  mutate(`100dpi` = factor(`100dpi`, levels = c("Tcm Bias", "Tex-Prog Bias", "Tex-Term Bias", "Divergent", "Tem_1 Bias", "Tem_2 Bias")), 
+         `21dpi` = factor(`21dpi`, levels = c("Tex-Prog Bias", "Divergent", "Tex-Int Bias", "Tex-KLR Bias"))) %>%
+  ungroup() %>% arrange(`21dpi`) %>% arrange(`100dpi`)
+
+head(longitudinal.df)
+
+```
+
+# correlation of clone phenotype frequencies at differnt timepoints
+```{r}
+# calculate correlations of prototypes based on individual clones' intraclonbal freq
+cor.input <- longitudinal.df %>% select(-c(TRB_CDR3, `21dpi` , `100dpi`))
+head(cor.input)
+cor.results <- cor.input %>% as.matrix() %>% rcorr()
+cor.results
+
+#check TexProg/cTcm and KLR/Tem1
+cor.input %>% ggplot(aes(x = `d021_Tex-Prog` , y =  `d100_Tcm`)) + geom_jitter(size = 0.5, alpha = 0.4) + geom_smooth(method = "lm", color = "red") + stat_cor()
+cor.input %>% ggplot(aes(x = `d021_Tex-KLR` , y =  `d100_Tem_1`)) + geom_jitter(size = 0.5, alpha = 0.4) + geom_smooth(method = "lm", color = "red") + stat_cor()
+cor.input %>% ggplot(aes(x = `d021_Tex-Prog` , y =  `d100_Tem_1`)) + geom_jitter(size = 0.5, alpha = 0.4) + geom_smooth(method = "lm", color = "red") + stat_cor()
+
+# determine significance
+## create new matrix in which to summarize p values
+sig_matrix <- matrix(" " , nrow = nrow(cor.results$r), ncol = ncol(cor.results$r))
+colnames(sig_matrix) <- colnames(cor.results$r)
+rownames(sig_matrix) <- rownames(cor.results$r)
+
+# sumamrize bonferoni corrected pvalues
+sig_matrix[cor.results$P <=  0.05 / cor.results$r %>% length()] <- "*"
+sig_matrix[cor.results$P <=  0.01 / cor.results$r %>% length()] <- "**" 
+sig_matrix[cor.results$P <=  0.001 / cor.results$r %>% length()] <- "***"
+
+# plot all correlations
+cor.results$r %>% Heatmap(col =  brewer.pal(9, "Reds"), #viridis(9) , 
+                      na_col = "white", border = T, 
+                      width = unit(8*0.7, "cm"), height = unit(8*0.7, "cm"), name = "Pearson R", 
+                      cluster_rows = T, cluster_columns = T,
+                      show_row_dend = T, show_column_dend = T, column_dend_height = unit(0.2, "cm"), row_dend_width = unit(0.2, "cm"), row_dend_side = "right",
+                      # bottom_annotation = column.annot, left_annotation = row.annot,
+                      # row_title = "Day 21 Behavior" , column_title = "Day 100 Behavior" , 
+                      row_title_side = "left", column_title_side = "bottom", row_names_side = "left",
+                      cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sig_matrix[i, j], x, y, gp = gpar(fontsize = 14, col = "white"))},
+                  )
+
+# plot only different timepoint correlations
+column.annot <- columnAnnotation(" " = colnames(cor.results$r[1:3, 4:8]), col = list(" " = pop.pal), show_legend = F)
+row.annot <- rowAnnotation(" " = rownames(cor.results$r[1:3, 4:8]), col = list(" " = pop.pal), show_legend = F)
+
+pop.pal
+
+hm.cor <- cor.results$r[1:3, 4:8] %>% Heatmap(
+                      
+                      col = viridis(9) , 
+                      na_col = "white", border = T, 
+                      width = unit(5*1, "cm"), height = unit(3*1, "cm"), name = "Pearson R", 
+                      cluster_rows = T, cluster_columns = T,
+                      show_row_dend = F, show_column_dend = F, 
+                      top_annotation = column.annot, right_annotation = row.annot,
+                      row_title = "21 dpi Subset" , column_title = "100 dpi Subset" ,
+                      row_title_side = "left", column_title_side = "bottom", row_names_side = "left",
+                      cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sig_matrix[1:3, 4:8][i, j], x, y, gp = gpar(fontsize = 14, col = "white"))},
+                  )
+
+hm.cor
+```
+
+# create plots to summarize phenotype transitions
+```{r}
+## SANKEY PLOT
+
+longitudinal.df %>% make_long(`21dpi`, `100dpi`) %>% 
+        ggplot(aes(x = x, next_x = next_x, node = node, next_node = next_node, fill = factor(node), label = node)) +
+        geom_sankey(flow.alpha = 0.5, width = .3) + 
+        # ggtitle(paste(unique(x$group), unique(x$Longitudinal))) +
+        plot.theme + labs(x = element_blank(), y = element_blank()) + 
+        theme(axis.line = element_blank(), axis.ticks = element_blank(), axis.text.y = element_blank()) + 
+        scale_fill_manual(values = cluster.pal, name = "Clone Behavior")
+
+
+### HEATMAP
+
+hm1 <- longitudinal.df %>% select(colnames(longitudinal.df)[grepl("d021", colnames(longitudinal.df))]) %>%
+      rename_with(~ gsub("d021_", "", .)) %>% 
+  Heatmap(name = "Frac of Clone", col = brewer.pal(9, "Purples"), 
+      split = longitudinal.df$`21dpi`,
+      row_title = paste0(longitudinal.df$TRB_CDR3 %>% length, " Clones Detected 21 and 100+ dpi"),
+      cluster_rows = F, cluster_columns = T, show_column_dend = F,
+      left_annotation = rowAnnotation("Behavior 21dpi" = longitudinal.df$`21dpi`, col = list("Behavior 21dpi" = cluster.pal), show_legend = F), 
+      width = unit(3*0.6, "cm"), height = unit(7, "cm"), 
+      column_title = "21dpi",
+      border = T)
+  
+hm2 <- longitudinal.df %>% select(colnames(longitudinal.df)[grepl("d100", colnames(longitudinal.df))]) %>%
+      rename_with(~ gsub("d100_", "", .)) %>% 
+  Heatmap(name = "Frac of Clone", col = brewer.pal(9, "Purples"), 
+      cluster_rows = F, cluster_columns = T, show_column_dend = F,
+      left_annotation = rowAnnotation("Behavior 100dpi" = longitudinal.df$`100dpi`, col = list("Behavior 100dpi" = cluster.pal), show_legend = F), 
+      width = unit(5*0.6, "cm"), height = unit(7, "cm"), 
+      column_title = "100dpi",
+      border = T)
+
+hm1 + hm2
+
+
+```
+
+# logistic regression to determine which d100 behaviors to form cTcm Biased clones
+```{r}
+# set up dataframe from prediction
+regress.df <- longitudinal.df %>% select(TRB_CDR3, `d021_Tex-Int`, `d021_Tex-KLR`, `d021_Tex-Prog`, `21dpi`, `100dpi` ) %>%# take clone bevhaviors and Frac in a given sort d21
+  dplyr::rename("TexKLR" = "d021_Tex-KLR", "TexInt" = "d021_Tex-Int", "TexProg" = "d021_Tex-Prog", "Behavior" = "21dpi") %>%
+  left_join(d021.wide %>% select(TRB_CDR3, CloneSize)) %>% # add clone size 
+  mutate(Tcm = ifelse(`100dpi`== "Tcm Bias", 1, 0)) # if Tcm biased clones -> 1, if not, 0
+
+# Run logistic regression model with Clone_Behavior as the predictor, 
+model <- glm(Tcm ~ Behavior, data = regress.df, family = binomial)
+summary(model)
+
+# Create new data frame with unique values of Day 21 Behavior and Generate predictions based on Behavior
+new_data <- data.frame(Behavior = unique(regress.df$Behavior)) 
+predictions <- predict(model, new_data, type = "response", se.fit = TRUE)
+
+# Store predictions and standard errors in the new data frame
+new_data$fit <- predictions$fit
+new_data$se.fit <- predictions$se.fit
+
+# pairwise comparisions
+emm <- emmeans(model, ~ Behavior, )
+
+sig_df <- as.data.frame(pairs(emm)) %>%
+  separate(contrast, into = c("group1", "group2"), sep = " - ") %>%
+  select(group1, group2, p.value) 
+
+sig_df
+  
+
+# plot comparisons
+ggplot(data = new_data, aes(x = fct_reorder(Behavior, fit), y = fit, color = Behavior)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey80") +
+  geom_point(size = 2.5) + 
+  geom_errorbar(aes(ymin = fit - 1.96 * se.fit, ymax = fit + 1.96 * se.fit, width = 0.2), width = 0.25) + # 95% confidence interval
+  plot.theme +
+  ylab("Predicted Probability of Tcm Bias") +
+  xlab("Behavior 21 dpi") +
+  theme(legend.position = "none") + coord_flip() + 
+  scale_y_continuous(limits = c(0,1.01)) +
+  scale_color_manual(values = cluster.pal)
+
+
+```
+
+
+
+
+
+
+

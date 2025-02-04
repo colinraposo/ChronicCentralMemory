@@ -1,0 +1,413 @@
+# integrate multiple 10X reactions by RPCA
+
+# load common libraries
+```{r}
+suppressPackageStartupMessages({
+
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(data.table)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  
+})
+```
+
+# set paths and load the list of demultiplexed seurat objects
+```{r}
+path <- "~/Experiments/CR96_scRNATCR_8dpiArmRechal"
+outs <- paste0(path, "/1_FilterSO_Multiseq/outs")
+
+so.list <- paste0(path, "/seurat_objects/7A_DemuxedSeuratObjectList.rds") %>% readRDS()
+```
+
+# remove genes function
+```{r}
+#remove TCR genes from VF lists
+remove_genes <- function(features, species, tcr=TRUE, ig=TRUE, cell_cycle=TRUE, mito=TRUE, histone=TRUE, ribosome=TRUE) {
+    print(paste("Before filtering:", length(features), "features"))
+
+    if (species == "human") {
+        if (tcr) {
+            features <- features[!grepl("^TR[ABGD][VDJC]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^IG[HLK][VDJC]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% unlist(cc.genes))]
+        }
+        if (mito) {
+            features <- features[!grepl("^MT-", features)]
+        }
+    }
+    if (species == "mouse") {
+        if (tcr) {
+            features <- features[!grepl("^Tr[abgd][vdjc]", features)]
+        }
+        if (tcr) {
+            features <- features[!grepl("^Tcr[abgd][vdjc]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^Ig[hlk][vdjc]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% stringr::str_to_title(unlist(cc.genes)))]
+        }
+        if (mito) {
+            features <- features[!grepl("^Mt-", features)]
+        }
+      
+       if (histone) {
+            features <- features[!grepl("^Hist", features)]
+       }
+      
+       if (ribosome) {
+            features <- features[!grepl("^Rps", features)]
+       }
+      
+      if (ribosome) {
+            features <- features[!grepl("^Rpl", features)]
+        }
+      
+    }
+
+    print(paste("After filtering:", length(features), "features"))
+    
+    return(features)
+}
+```
+
+# pre-processing
+```{r}
+so.list <- lapply(so.list, function(x) {
+  # remove doublets and unidentified cells from individual so w/in so.list
+  x <- subset(x, !is.na(multiseq_class) & multiseq_class != "Doublet")
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+  return(x)
+})
+```
+
+# integration workflow: reciprocal PCA
+```{r}
+# doing integration via RPCA, this method is best for datasets with large sets of cells that don't overlap - very likely there will be TET+ and TET- cells that do not overlap 
+
+## find overlapping features
+### remove TCR genes etc
+features <- SelectIntegrationFeatures(object.list = so.list) %>% 
+  remove_genes(species = "mouse" , tcr=TRUE, ig=F, cell_cycle=F, mito=F, histone=F, ribosome=F)
+
+## PCA run on integration features, not all features
+so.list <- lapply(so.list, FUN = function(x) {
+    x <- ScaleData(x, features = features, verbose = FALSE)
+    x <- RunPCA(x, features = features, verbose = FALSE)
+})
+
+## ID anchors
+anchors <- FindIntegrationAnchors(object.list = so.list, anchor.features = features, reduction = "rpca", k.anchor = 5)
+
+## created integrated dataset
+so.rpca <- IntegrateData(anchorset = anchors)
+
+## specify that we will perform downstream analysis on the corrected data note that the
+### original unmodified data still resides in the 'RNA' assay
+DefaultAssay(so.rpca) <- "integrated"
+
+```
+
+# mutate the metadata of seurat object
+```{r}
+
+so.rpca@meta.data
+table(so.rpca$orig.ident, so.rpca$multiseq_class)
+
+so.rpca@meta.data$Group <- substr(so.rpca@meta.data$multiseq_class, 1, nchar(so.rpca@meta.data$multiseq_class) -2) 
+so.rpca@meta.data$Group[so.rpca@meta.data$multiseq_class == "EndoGP33"] <- "EndoGP33"
+
+so.rpca@meta.data$Rep <- substr(so.rpca@meta.data$multiseq_class, 8, 8)
+so.rpca@meta.data$Rep[so.rpca@meta.data$multiseq_class == "EndoGP33"] <- "EndoGP33"
+
+so.rpca@meta.data$Tet <- substr(so.rpca@meta.data$orig.ident, 1, 7)
+so.rpca@meta.data$Tet[so.rpca@meta.data$multiseq_class == "EndoGP33"] <- "GP33pos"
+
+so.rpca@meta.data$Tet_Group <- paste(so.rpca@meta.data$Tet, so.rpca@meta.data$Group, sep = "_")
+so.rpca@meta.data$Tet_Group[so.rpca@meta.data$multiseq_class == "EndoGP33"] <- "Endo_GP33"
+
+table(so.rpca$Group, so.rpca$Rep)
+table(so.rpca$Group, so.rpca$Tet)
+table(so.rpca$Group, so.rpca$Tet_Group)
+
+```
+
+# first pass of clustering
+```{r}
+so.rpca <- ScaleData(so.rpca)
+so.rpca <- RunPCA(so.rpca, npcs = 30, features = VariableFeatures(so.rpca))
+
+so.rpca <- RunUMAP(so.rpca, dims = 1:14)
+
+so.rpca <- FindNeighbors(so.rpca, dims = 1:14)
+so.rpca <- FindClusters(so.rpca,resolution = 0.3)
+
+DimPlot(so.rpca, label = T)
+DimPlot(so.rpca, split.by = "Tet_Group", ncol = 3) & NoAxes()
+
+FeaturePlot(so.rpca, features = c("Klrg1", "Cx3cr1", "Pdcd1", "Tox", "Havcr3" , "Tcf7", "Sell", "Cd44"), ncol = 4) & NoLegend() & NoAxes()
+
+# add cell cycle
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+so.rpca <- CellCycleScoring(so.rpca, s.features = s.genes, g2m.features = g2m.genes)
+
+DimPlot(so.rpca, label = T)
+DimPlot(so.rpca, group.by = "Phase") & NoAxes()
+```
+
+# gene expression of initial gene expression clusters
+```{r}
+
+# Vln plot for CD44, Sell, TCF, Cxcr3 - see if any naive cells made it into the sample
+## Cluster NINE appears to be naive T cells
+VlnPlot(so.rpca, features = c("Tcf7", "Sell", "Cd44" , "Cxcr3"), pt.size = 0, ncol = 2)
+DotPlot(so.rpca, features = c("Tcf7", "Sell", "Cd44" , "Cxcr3"))
+
+# diferential genes per cluster
+cluster.markers <- FindAllMarkers(so.rpca, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", features = features)
+
+# get just the top 5 featurs per cluster
+cluster.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> topgenes
+
+hm.df <- DotPlot(so.rpca, features=unique(topgenes$gene))$data[, c("features.plot", "id", "pct.exp", "avg.exp.scaled")]
+## mutate the data bit
+hm.df <- hm.df[,c(1,2,4)] %>% pivot_wider(names_from = id, values_from = avg.exp.scaled)%>% as.data.frame
+rownames(hm.df) <- hm.df$features.plot
+
+## make heatmap
+hm <- hm.df[,-1] %>% 
+  Heatmap(name = "Z-score", # name over the legend
+          col = rev(brewer.pal(9, "RdBu")), # values for the cell values
+          height = unit(16, "in"), width = unit(3, "in"), 
+          show_column_dend = F, show_row_names = T, column_dend_height = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T # do you want the rows and columns to cluster
+        )
+
+# pdf(file = paste0(outs, "/1B - init clusters hm.pdf"), height = unit(18, "in"), width = unit(6, "in"))
+hm
+# dev.off()
+
+# use singleR to check for non-T cell clusters - in reality, because we sorted pure T cells, it will pull out low quality cells
+library(SingleR)
+ref <- MouseRNAseqData()
+pred <- SingleR(test = so.rpca@assays$RNA@data, ref = ref, labels = ref$label.main)
+so.rpca@meta.data$singleR_label <- pred$pruned.labels
+
+##single R plots
+p1 <- DimPlot(so.rpca, label = F, group.by = "singleR_label", cols = brewer.pal(11, "Paired"))+ NoLegend() 
+p2 <- so.rpca@meta.data %>% 
+    dplyr::count(seurat_clusters, singleR_label) %>% group_by(seurat_clusters) %>% mutate(freq_of_cluster = n/sum(n)) %>% 
+    ggplot(aes(x = seurat_clusters, y = freq_of_cluster, fill = singleR_label)) + 
+    geom_col() + scale_fill_manual(values = brewer.pal(11, "Paired")) + theme_cowplot()
+  
+plot_grid(p1, p2, ncol = 1)
+
+DimPlot(so.rpca, label = TRUE) + NoLegend()
+
+```
+
+# remove naive T cells (C9) and re-cluster
+```{r}
+# remove cells in cluster 9 (Naive T cells)
+so.subset <- subset(so.rpca, seurat_clusters %in% c("0" , "1", "2", "3" ,"4", "5", "6", "7", "8", "10", "11")) 
+DimPlot(so.subset)
+
+# find variable features of subseted dataset and remove TCR genes + also remove histone, cell cycle, ribosome genes, mito 
+so.subset <- FindVariableFeatures(so.subset)
+
+features2 <- remove_genes(VariableFeatures(so.subset), 
+                         species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+
+so.subset <- ScaleData(so.subset, verbose = T)
+so.subset <- RunPCA(so.subset, npcs = 30, verbose = T, features = features2)
+
+so.subset <- RunUMAP(so.subset, dims = 1:12)
+
+so.subset <- FindNeighbors(so.subset, dims = 1:12)
+so.subset <- FindClusters(so.subset,resolution = 0.4)
+
+DimPlot(so.subset, label = T)
+DimPlot(so.subset, split.by = "Tet_Group", ncol = 3) & NoAxes()
+DimPlot(so.subset, group.by = "Rep", split.by = "Tet_Group", ncol = 3) & NoAxes()
+
+DefaultAssay(so.subset) <- "RNA"
+FeaturePlot(so.subset, features = c("Klrg1", "Cx3cr1", "C3cr3", "Il7r", "Pdcd1", "Tox", "Havcr2" , "Tcf7",  "Mki67"), ncol = 4) & NoLegend() & NoAxes()
+DimPlot(so.subset, group.by = "Phase") & NoAxes()
+
+```
+
+# top deg for second set of clusters
+```{r}
+# diferential genes per cluster
+cluster.markers <- FindAllMarkers(so.subset, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", features = features2)
+
+# get just the top 5 featurs per cluster
+cluster.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> topgenes
+
+hm.df <- DotPlot(so.subset, features=unique(topgenes$gene))$data[, c("features.plot", "id", "pct.exp", "avg.exp.scaled")]
+## mutate the data bit
+hm.df <- hm.df[,c(1,2,4)] %>% pivot_wider(names_from = id, values_from = avg.exp.scaled)%>% as.data.frame
+rownames(hm.df) <- hm.df$features.plot
+
+## make heatmap
+hm <- hm.df[,-1] %>% 
+  Heatmap(name = "Z-score", # name over the legend
+          col = rev(brewer.pal(9, "RdBu")), # values for the cell values
+          height = unit(16, "in"), width = unit(3, "in"), 
+          show_column_dend = F, show_row_names = T, column_dend_height = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T # do you want the rows and columns to cluster
+        )
+
+# pdf(file = paste0(outs, "/1B - cluster_iteration_1_hm.pdf"), height = unit(18, "in"), width = unit(6, "in"))
+hm
+# dev.off()
+```
+
+# remove lowquality cells (high mito low RNA, C10) and recluster
+```{r}
+FeaturePlot(so.subset, features = c("percent.mt", "nFeature_RNA", "nCount_RNA"), ncol = 3) & NoLegend()
+VlnPlot(so.subset, features = c("percent.mt", "nFeature_RNA", "nCount_RNA"), ncol = 3, pt.size = 0) 
+
+# remove cells in cluster 10 - high mito low RNA
+so.subset2 <- subset(so.subset, seurat_clusters %in% c("0" , "1", "2", "3" ,"4", "5", "6", "7", "8", "9", "11")) 
+
+DefaultAssay(so.subset2) <- "integrated"
+
+DimPlot(so.subset2)
+
+# find variable features of subseted dataset and remove TCR genes + also remove histon, cell cycle, ribosome genes, mito 
+so.subset2 <- FindVariableFeatures(so.subset2)
+
+features3 <- remove_genes(VariableFeatures(so.subset2), 
+                         species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+
+so.subset2 <- ScaleData(so.subset2, verbose = T)
+so.subset2 <- RunPCA(so.subset2, npcs = 30, verbose = T, features = features3)
+
+so.subset2 <- RunUMAP(so.subset2, dims = 1:12)
+
+so.subset2 <- FindNeighbors(so.subset2, dims = 1:12)
+so.subset2 <- FindClusters(so.subset2,resolution = 0.4)
+
+DimPlot(so.subset2, label = T)
+DimPlot(so.subset2, split.by = "Tet_Group", ncol = 3) & NoAxes()
+DimPlot(so.subset2, group.by = "Rep", split.by = "Tet_Group", ncol = 3) & NoAxes()
+
+DefaultAssay(so.subset2) <- "RNA"
+FeaturePlot(so.subset2, features = c("Klrg1", "Cx3cr1", "C3cr3", "Il7r", "Pdcd1", "Tox", "Havcr2" , "Tcf7",  "Mki67"), ncol = 4) & NoLegend() & NoAxes()
+DimPlot(so.subset2, group.by = "Phase") & NoAxes()
+
+```
+
+# top deg for reclustered object
+```{r}
+# diferential genes per cluster
+cluster.markers <- FindAllMarkers(so.subset2, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", features = features3)
+
+# get just the top 5 featurs per cluster
+cluster.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> topgenes
+
+hm.df <- DotPlot(so.subset2, features=unique(topgenes$gene))$data[, c("features.plot", "id", "pct.exp", "avg.exp.scaled")]
+## mutate the data bit
+hm.df <- hm.df[,c(1,2,4)] %>% pivot_wider(names_from = id, values_from = avg.exp.scaled)%>% as.data.frame
+rownames(hm.df) <- hm.df$features.plot
+
+## make heatmap
+hm <- hm.df[,-1] %>% 
+  Heatmap(name = "Z-score", # name over the legend
+          col = rev(brewer.pal(9, "RdBu")), # values for the cell values
+          height = unit(16, "in"), width = unit(3, "in"), 
+          show_column_dend = F, show_row_names = T, column_dend_height = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T # do you want the rows and columns to cluster
+        )
+
+hm
+
+```
+
+# remove lowquality cells (apoptotic cells, C5) and recluster
+```{r}
+#  Gene epxrsssion of C5 High CD80, Cdkn2a (cell cell arrest), Bbc3 (upregulated modulator of apoptosis) -> all point to cell death 
+DimPlot(so.subset2, label = T)
+FeaturePlot(so.subset2, features = c("Cd80", "Cdkn2a", "Bbc3"))
+
+# remove C5 
+so.subset3 <- subset(so.subset2, seurat_clusters %in% c("0" , "1", "2", "3" ,"4", "6", "7", "8", "9", "10")) 
+DimPlot(so.subset3)
+
+DefaultAssay(so.subset3) <- "integrated"
+
+# find variable features of subseted dataset and remove TCR genes + also remove histon, cell cycle, ribosome genes, mito 
+so.subset3 <- FindVariableFeatures(so.subset3)
+
+features4 <- remove_genes(VariableFeatures(so.subset3), 
+                         species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+
+so.subset3 <- ScaleData(so.subset3, verbose = T)
+so.subset3 <- RunPCA(so.subset3, npcs = 30, verbose = T, features = features4)
+
+so.subset3 <- RunUMAP(so.subset3, dims = 1:10)
+
+so.subset3 <- FindNeighbors(so.subset3, dims = 1:10)
+so.subset3 <- FindClusters(so.subset3,resolution = 0.4)
+
+DimPlot(so.subset3, label = T)
+DimPlot(so.subset3, split.by = "Tet_Group", ncol = 3) & NoAxes()
+DimPlot(so.subset3, group.by = "Rep", split.by = "Tet_Group", ncol = 3) & NoAxes()
+
+FeaturePlot(so.subset3, features = c("Tcf7", "Pdcd1", "Cx3cr1", "Cxcr3", "Mki67", "Ifit1"), ncol = 3)
+```
+
+# top deg for dataset with apopototic cells removed
+```{r}
+# diferential genes per cluster
+cluster.markers <- FindAllMarkers(so.subset3, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", features = features4)
+
+# get just the top 5 featurs per cluster
+cluster.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> topgenes
+
+hm.df <- DotPlot(so.subset3, features=unique(topgenes$gene))$data[, c("features.plot", "id", "pct.exp", "avg.exp.scaled")]
+## mutate the data bit
+hm.df <- hm.df[,c(1,2,4)] %>% pivot_wider(names_from = id, values_from = avg.exp.scaled)%>% as.data.frame
+rownames(hm.df) <- hm.df$features.plot
+
+## make heatmap
+hm <- hm.df[,-1] %>% 
+  Heatmap(name = "Z-score", # name over the legend
+          col = rev(brewer.pal(9, "RdBu")), # values for the cell values
+          height = unit(16, "in"), width = unit(3, "in"), 
+          show_column_dend = F, show_row_names = T, column_dend_height = unit(0.15, "in"), 
+          cluster_rows = T, cluster_columns = T # do you want the rows and columns to cluster
+        )
+
+hm
+```
+
+# save RDS for object
+```{r}
+saveRDS(so.subset3, file = paste0(path, "7B_SeuratObject_Clustered.rds"))
+```
+
+
+

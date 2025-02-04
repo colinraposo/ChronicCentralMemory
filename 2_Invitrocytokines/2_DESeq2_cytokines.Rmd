@@ -1,0 +1,113 @@
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ComplexHeatmap)
+  library(RColorBrewer)
+  library(readxl)
+  library(viridis)
+  library(DESeq2)
+})
+
+
+cols <- c("Arm: aTcm" = "#005297", 
+          "Cl13 100+ dpi: cTcm" = "#65c7ca", 
+          "Cl13 100+ dpi: Tex-Int" = "#f6d13a", 
+          "Cl13 100+ dpi: Tex-KLR" =  "#f8a523",
+          "Cl13 100+ dpi: Tex-Term" = "#b31e0e", 
+          "Cl13 100+ dpi: Tex-Prog" = "#a94d9a", 
+          "Cl13 21dpi: Tex-Prog" = "#a0a1d1", 
+          "Naive" = "grey70")
+
+```
+
+# import data
+```{r}
+data <- read_xlsx("/Users/craposo/Desktop/Github Upload/2_Invitrocytokines/LegendplexSummaryData.xlsx")
+
+data %>% filter(!is.na(Sample)) %>% 
+  select(Sample, IFNg, TNFa, `IL-2`) %>% column_to_rownames("Sample") %>% 
+  scale() %>% t %>%
+  Heatmap(name = "Z Score (Cytokine Conc.)",col = viridis(9, option = "G"), 
+          border = T, 
+          row_dend_width = unit(0.2, "cm"), column_dend_height = unit(0.2, "cm"),
+          height = unit(0.7*3, "cm"), width = unit(20, "cm"), )
+
+
+```
+# cacluate significant with DE-SEQ2
+```{r}
+
+# subset on only d100 and controls
+test.conditions <- c("Arm: aTcm", "Cl13 100+ dpi: cTcm", "Cl13 100+ dpi: Tex-Int", "Cl13 100+ dpi: Tex-KLR", "Cl13 100+ dpi: Tex-Term", "Cl13 100+ dpi: Tex-Prog", "Cl13 21dpi: Tex-Prog", "Naive")
+
+data2 <- data %>% mutate(condition = substr(Sample, 0, nchar(Sample) -2)) %>% filter(condition %in% test.conditions) 
+
+
+  # create de-seq object
+  de.seq.df <- data2 %>% filter(!is.na(Sample)) %>%  select(Sample, condition, IFNg, TNFa, `IL-2`) %>%
+        mutate(IFNg = as.integer(IFNg * 1e6), TNFa = as.integer(TNFa * 1e6), `IL-2` = as.integer(`IL-2` * 1e6)) # need to make all values integers
+  
+  de.seq.df
+  
+  dds <- DESeqDataSetFromMatrix(countData = de.seq.df[,c(3:5)] %>% t, colData = de.seq.df[,c(1:2)], design = ~ condition)
+  dds <- DESeq(dds)#, fitType = "parametric")
+  
+  # test all groups against cTcm
+  groups <- unique(unfactor(dds$condition))[-5]
+  
+  deseq_results_list <- lapply(groups, function(group){
+    res <- results(dds, contrast = c("condition", "Cl13 100+ dpi: cTcm", group))
+    c(group, res$padj) %>% return()
+  })
+  
+  deseq_results <- do.call(rbind, deseq_results_list) 
+  colnames(deseq_results) <- c("Group", "IFNg", "TNFa", "IL-2")
+  deseq_results <- deseq_results %>% as_data_frame() %>% column_to_rownames("Group") 
+  
+  # create new DF for Sig values
+  sig.df <- deseq_results %>% mutate(TNFa = as.numeric(TNFa),  IFNg = as.numeric(IFNg), `IL-2` = as.numeric(`IL-2`)) %>%
+    mutate(IFNg = ifelse(IFNg < 0.05, "*" , IFNg), TNFa = ifelse(TNFa < 0.05, "*" , TNFa), `IL-2` = ifelse(`IL-2` < 0.05, "*" , `IL-2`)) %>%
+    # mutate(IFNg = ifelse(IFNg < 0.01, "**" , IFNg), TNFa = ifelse(TNFa < 0.01, "**" , TNFa), `IL-2` = ifelse(`IL-2` < 0.01, "**" , `IL-2`)) %>%
+    # mutate(IFNg = ifelse(IFNg < 0.001, "***" , " "), TNFa = ifelse(TNFa < 0.001, "***" , " "), `IL-2` = ifelse(`IL-2` < 0.001, "***" , " "))
+    mutate(IFNg = ifelse(IFNg < 0.05, "*" , " "), TNFa = ifelse(TNFa < 0.05, "*" , " "), `IL-2` = ifelse(`IL-2` < 0.05, "*" , " "))
+  
+
+  
+  # add in NS values for cTcm
+  temp <- data.frame(IFNg = " ", TNFa = " ", `IL-2` = " ")
+    colnames(temp) <- colnames(sig.df)
+    rownames(temp) <- "Cl13 100+ dpi: cTcm"
+    sig.df2 <- rbind(sig.df, temp)
+```
+
+# plot hm with signifcance
+```{r}
+
+hm.df <- data2 %>% filter(!is.na(Sample)) %>% 
+  select(Sample, IFNg, TNFa, `IL-2`) %>% column_to_rownames("Sample") %>% 
+  scale() %>% as.data.frame() %>% rownames_to_column(var = "sample") %>%
+  mutate(sample = substr(sample, 0, nchar(sample) -2)) %>%
+  group_by(sample) %>% summarise(IFNg = mean(IFNg), TNFa = mean(TNFa), `IL-2` = mean(`IL-2`)) %>% 
+  mutate(sample = factor(sample, levels = c("Naive", "Arm: aTcm", "Cl13 100+ dpi: cTcm", 
+                            "Cl13 100+ dpi: Tex-Prog", "Cl13 100+ dpi: Tex-KLR", "Cl13 100+ dpi: Tex-Int",  "Cl13 100+ dpi: Tex-Term", "Cl13 21dpi: Tex-Prog"))) %>%
+  arrange(sample)%>%
+  column_to_rownames("sample")
+
+# redorder sig.df2 to match
+sig.df2 <- sig.df2[match(rownames(hm.df), rownames(sig.df2)), ] # reorder to match
+
+left.anno <- rowAnnotation(` ` = rownames(hm.df), show_legend = F, col = list(` ` = cols))
+
+hm <- hm.df %>%  Heatmap(name = "Z Score (Cytokine Conc.)", col = viridis(9, option = "F"), 
+          width = unit(0.7*3, "cm"), height =  unit(8*0.7, "cm"), 
+          border = T, cluster_rows = F,
+          left_annotation = left.anno,
+          show_row_dend = F, show_column_dend = F,
+          cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sig.df2[i, j], x, y, gp = gpar(fontsize = 15, col = "white"))}
+)
+
+hm
+
+
+```
+

@@ -1,0 +1,406 @@
+# here we will dive into clonal behaviors of T cells in during Cl13 infection - either during the chronic phase or after viral clearance
+
+# load common libraries + load SO + set plot themes
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(ggrepel)
+  library(data.table)
+  library(ComplexHeatmap)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(ggridges)
+})
+
+# read in seurat object
+path <- "~/ChronicMemoryGithub_Submission/1_scRNATCRseqAtlas"
+so <- readRDS(paste0(path, "/data/1D_IntegratedSeuratObject_IDdClusters.rds"))
+
+# add a clone_id column to include cdr3, replicate, and group - there shouldnt be any overlapping TCRs but just to be safe
+so@meta.data$clone_id <- paste(so$Group, so$orig.ident,so$REP ,  so$cdr3s_nt, sep = "_")
+```
+
+# set plot aesthetics
+```{r}
+# palette
+clusterpal <- c(
+  "Tcm" = "#65c7ca",
+  "Tem_1" = "#f8a523",
+  "Tem_2" = "#f6d13a",
+  "Tex-Term" = "#b31e0e",
+  "Tex-Int" = "#de311e",
+  "Tex-KLR" = "#E27E73",
+  "Tex-ISG" = "#a0a1d1",
+  "Tex-Prog" = "#a94d9a",
+  "Prolif" = "#e6af7c"
+  )
+
+grouppal <- c("Chronic Cl13" = "#941A1D", "Cleared Cl13" = "#F37C79", "Arm" = "#498DCB")
+
+plot.theme.umap <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5), 
+        #panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.5, color = "grey80"),
+        axis.text = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "plain")) 
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"))
+
+plot.theme.box <- theme_bw() + 
+  theme(plot.title = element_text(hjust =  0.5 , size = 14, color = "black"),
+        plot.subtitle = element_text(hjust = 0.5 , size = 10, color = "black"), 
+        axis.text = element_text(color = "black", size = 12),
+        axis.title = element_text(size = 12),
+        axis.ticks = element_line(color = "black", linewidth = 0.7), 
+        strip.background = element_blank(), strip.text = element_text(hjust = 0, size = 11),
+        panel.border = element_rect(colour = "black", linewidth = 0.7), 
+        panel.grid = element_blank()
+        )
+```
+
+# remove genes function
+```{r}
+#remove TCR genes from VF lists
+remove_genes <- function(features, species, tcr=TRUE, ig=TRUE, cell_cycle=TRUE, mito=TRUE, histone=TRUE, ribosome=TRUE) {
+    print(paste("Before filtering:", length(features), "features"))
+
+    if (species == "human") {
+        if (tcr) {
+            features <- features[!grepl("^TR[ABGD][VDJC]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^IG[HLK][VDJC]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% unlist(cc.genes))]
+        }
+        if (mito) {
+            features <- features[!grepl("^MT-", features)]
+        }
+    }
+    if (species == "mouse") {
+        if (tcr) {
+            features <- features[!grepl("^Tr[abgd][vdjc]", features)]
+        }
+        if (tcr) {
+            features <- features[!grepl("^Tcr[abgd][vdjc]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^Ig[hlk][vdjc]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% stringr::str_to_title(unlist(cc.genes)))]
+        }
+        if (mito) {
+            features <- features[!grepl("^Mt-", features)]
+        }
+      
+       if (histone) {
+            features <- features[!grepl("^Hist", features)]
+       }
+      
+       if (ribosome) {
+            features <- features[!grepl("^Rps", features)]
+       }
+      
+      if (ribosome) {
+        }
+      
+    }
+
+    print(paste("After filtering:", length(features), "features"))
+    
+    return(features)
+}
+```
+
+# Clonal Diversity and # of clones per sample
+### we found that there's less clonal diversity in cleared cl13 than either chronic Cl13 or Acute - it was an interesting finding and tracks with what we think that only select Tex clones can persist long term, but didnt focus on this in the mansucript
+```{r}
+suppressPackageStartupMessages({
+library(ineq)
+library(vegan)
+})
+
+# create a dataframe(diversity.df) of clone counts per sample
+diversity.df <-so@meta.data %>% filter(chains =="ab") %>% 
+  dplyr::count(clone_id, Group, REP, orig.ident) %>% filter(n > 1) %>% 
+  group_by(orig.ident, Group, REP) %>% mutate(freq = n / sum(n)) %>% 
+  ungroup() %>%
+  mutate(SampleID = paste(orig.ident, Group, REP, sep = "_")) %>% 
+  mutate(Group = ifelse(Group == "Cl13 d100+", "Cleared Cl13", Group)) %>% 
+  mutate(Group = ifelse(Group == "Cl13 d21-26", "Chronic Cl13", Group))
+
+# split tcr_clean into tcr.list by samples
+diversity.list <- split(diversity.df, diversity.df$SampleID)
+
+# calculate gini index for each sample separately  ===========================
+gini.list <- lapply(diversity.list, function(x) {
+ gini <- Gini(x$freq)
+ df <- x %>% group_by(SampleID) %>% summarise( 
+    across(c(Group, REP, orig.ident), first))
+ df$Gini <- gini
+ return(df)
+})
+
+gini.results <- do.call(rbind, gini.list)
+
+p1 <- gini.results %>% ggplot(aes(x = fct_reorder(Group, Gini), y = Gini)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(width = 0.23, aes(color = Group), show.legend = F, size = 2) +
+  stat_compare_means(comparisons = list(c("Cleared Cl13", "Chronic Cl13"), c("Arm", "Cleared Cl13"), c("Arm", "Chronic Cl13")), method = "t.test", tip.length = 0) + 
+  scale_color_manual(values = grouppal) + 
+  plot.theme + rotate_x_text(45) + labs(x = element_blank(), y = "Gini Index")  + 
+  scale_y_continuous(expand = expansion(mult = 0.15))
+
+#  calculate shannon diversity for each sample separately ===========================
+shannon.list <- lapply(diversity.list, function(x) {
+ div <- diversity(x$freq,  index = "shannon")
+ df <- x %>% group_by(SampleID) %>% summarise(
+    across(c(Group, REP, orig.ident), first))
+ df$Shannon <- div
+ return(df)
+})
+
+shannon.results <- do.call(rbind, shannon.list)
+
+p2 <- shannon.results %>% ggplot(aes(x = fct_reorder(Group, -1*Shannon), y = Shannon)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(width = 0.23, aes(color = Group), show.legend = F, size = 2) +
+  stat_compare_means(comparisons = list(c("Cleared Cl13", "Chronic Cl13"), c("Arm", "Cleared Cl13"), c("Arm", "Chronic Cl13")), method = "t.test", tip.length = 0) + 
+  scale_color_manual(values = grouppal) + 
+  plot.theme + rotate_x_text(45) + labs(x = element_blank(), y = "Shannon Diversity") + 
+  scale_y_continuous(expand = expansion(mult = 0.15))
+
+# add # of expanded clones per mouse  ===========================
+
+p3 <- diversity.df %>% count(Group, SampleID) %>% ggplot(aes(x = Group, y = n)) +geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(width = 0.23, aes(color = Group), show.legend = F, size = 2) +
+  # stat_compare_means(comparisons = list(c("Cleared Cl13", "Chronic Cl13"), c("Arm", "Cleared Cl13"), c("Arm", "Chronic Cl13")), method = "t.test", tip.length = 0) + 
+  scale_color_manual(values = grouppal) + 
+  plot.theme + rotate_x_text(45) + labs(x = element_blank(), y = "Number of Clones per Mouse")  + 
+  scale_y_continuous(limits = c(0,100))
+
+plot_grid(p3, p2, p1, ncol = 3)
+
+# ggsave(path = outs, filename = "3C - DiversityIndecies_plusCloneNumebr.pdf", width = 7.5, height = 3.5)
+
+```
+
+# Cl13 d100+: define clone behaviors by kmeans clustering of intraclonal proportions
+```{r}
+# find TCRab clones that are expanded (clone size>1)
+exp.clones <- so@meta.data %>% filter(Group == "Cl13 d100+", chains =="ab") %>% 
+  dplyr::count(clone_id, name = "CloneSize") %>% 
+  mutate(CloneFreq = CloneSize / sum(CloneSize)) %>% ungroup %>% 
+  select(clone_id, CloneFreq, CloneSize) %>% filter(CloneSize > 1)
+
+# determine phenotype proportion per clone
+clone.df <- so@meta.data %>% filter(clone_id %in% exp.clones$clone_id) %>% 
+  dplyr::count(cell_cluster, clone_id) %>%
+  group_by(clone_id) %>% mutate(n = n/sum(n)) %>%
+  pivot_wider(names_from = cell_cluster, values_from = n) %>%
+  ungroup() %>% as.data.frame() %>%
+  mutate(across(everything(), ~replace_na(.x, 0))) %>% 
+  left_join(exp.clones) 
+
+head(clone.df)
+
+# cluster clones based on clone proportions
+set.seed(22)
+clusters <- kmeans(clone.df %>% select(-c(clone_id, CloneSize, CloneFreq)), centers = 5)
+clone.df$Clone_Behavior <- clusters$cluster
+
+# rename clusters based on phenotype prop
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "1"] <- "Tem_2 Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "2"] <- "Tem_1 Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "3"] <- "Divergent"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "4"] <- "Tcm Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "5"] <- "Tex Bias"
+
+# heatmaps
+col.annot <- columnAnnotation(` `  = select(clone.df, -c(clone_id, Clone_Behavior, CloneFreq,  CloneSize)) %>% colnames(), 
+              col = list(` ` = clusterpal), show_legend = F)
+size.annot <- rowAnnotation(` ` = anno_barplot(clone.df$CloneFreq %>% log2, baseline = "min"))
+
+clone.hm <- clone.df %>% select(-c(clone_id, Clone_Behavior, CloneSize, CloneFreq)) %>% 
+  Heatmap(name = "Fraction of Clone",
+          show_column_names = T, border = T, col= brewer.pal(9, "Purples"), 
+          row_split = clone.df$Clone_Behavior,
+          show_row_dend = F, show_column_dend = T,
+          row_title_rot = 0, 
+          width = unit(9*0.7, "cm"), height = unit(9*0.7, "cm"), column_dend_height = unit(0.2, "cm"),
+          top_annotation = col.annot, right_annotation = size.annot,
+          column_title = paste0("Cleared Cl13 n=", clone.df$clone_id %>% length(), " Clones >1 Cell") 
+          )
+clone.hm
+
+#save for future use
+clone.df.Cl13Cleared <- clone.df
+```
+
+
+# Cl13 Chronic: define clone behaviors by the same method
+```{r}
+
+# find TCRab clones that are expanded (clone size>1)
+exp.clones <- so@meta.data %>% filter(Group == "Cl13 d21-26", chains =="ab") %>% 
+  dplyr::count(clone_id, name = "CloneSize") %>% 
+  mutate(CloneFreq = CloneSize / sum(CloneSize)) %>% ungroup %>% 
+  select(clone_id, CloneFreq, CloneSize) %>% filter(CloneSize > 1)
+
+# phenotype proportion per clone
+clone.df <- so@meta.data %>% filter(clone_id %in% exp.clones$clone_id) %>% 
+  dplyr::count(cell_cluster, clone_id) %>%
+  group_by(clone_id) %>% mutate(n = n/sum(n)) %>%
+  pivot_wider(names_from = cell_cluster, values_from = n) %>%
+  ungroup() %>% as.data.frame() %>%
+  mutate(across(everything(), ~replace_na(.x, 0))) %>% 
+  left_join(exp.clones) 
+
+head(clone.df)
+
+
+# cluster clones based on clone proportions
+set.seed(22)
+clusters <- kmeans(clone.df %>% select(-c(clone_id, CloneSize, CloneFreq)), centers = 5)
+clone.df$Clone_Behavior <- clusters$cluster
+
+# rename clusters
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "1"] <- "Tex-KLR Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "2"] <- "Tex-Term Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "3"] <- "Divergent"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "4"] <- "Tex-Prog Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "5"] <- "Tex-Int Bias"
+
+
+# heatmaps
+col.annot <- columnAnnotation(` `  = select(clone.df, -c(clone_id, Clone_Behavior, CloneFreq,  CloneSize)) %>% colnames(), 
+              col = list(` ` = clusterpal), show_legend = F)
+size.annot <- rowAnnotation(` ` = anno_barplot(clone.df$CloneFreq %>% log2, baseline = "min"))
+
+clone.hm <- clone.df %>% select(-c(clone_id, Clone_Behavior, CloneSize, CloneFreq)) %>% 
+  Heatmap(name = "Fraction of Clone",
+          show_column_names = T, border = T, col= brewer.pal(9, "Purples"), 
+          row_split = clone.df$Clone_Behavior,
+          show_row_dend = F, show_column_dend = T,
+          row_title_rot = 0, 
+          width = unit(9*0.7, "cm"), height = unit(9*0.7, "cm"), column_dend_height = unit(0.2, "cm"),
+          top_annotation = col.annot, right_annotation = size.annot,
+          column_title = paste0("Chronic Cl13 n=", clone.df$clone_id %>% length(), " Clones >1 Cell") 
+          )
+
+clone.hm
+
+clone.df.cl13chronic <- clone.df
+```
+
+# Cl13 day 100+ : plot Top Clones UMAP 
+```{r}
+# select some of the top clones from each behavior 
+clone.df.Cl13Cleared %>% group_by(Clone_Behavior) %>% slice_max(n = 20, order_by = CloneSize)# %>% select(CloneSize, Clone_Behavior, clone_id)
+
+# dim recution plots
+umap.df <- data.frame(so@meta.data,  so@reductions$umap@cell.embeddings)
+
+# vector of clones
+var.list <- c("Cl13 d100+_CR119_3_TRB:TGTGCCAGCTCTCTCCATCGCTCCGACTACACCTTC;TRA:TGTGCTATGGAACTTGACTATGCAAACAAGATGATCTTT",  #Tcm
+              "Cl13 d100+_CR119_5_TRB:TGTGCCAGCAGCTTCTCCTATGAACAGTACTTC;TRA:TGTGCTACCCATGACACAAATGCTTACAAAGTCATCTTT", # Tem-1
+              "Cl13 d100+_CR119_4_TRB:TGTGCCAGCAGTGACTGGACAGACACAGAAGTCTTCTTT;TRA:TGTGCAGTGAGGGGCAATAACAGAATCTTCTTT", # Tem-2
+              "Cl13 d100+_CR119_1_TRB:TGTGCTAGCAGTTTAATACAATCAGAAGTCTTCTTT;TRA:TGCGCAGTCAGTGAAGGTTCAGCCTTAGGGAGGCTGCATTTT", # Tex
+              "Cl13 d100+_CR119_3_TRB:TGTGCCAGCAGCCCCGACTGGGGGGAAGACACCCAGTACTTT;TRA:TGTGCTATGAGAGAGTGGGCATCCTCCTCCTTCAGCAAGCTGGTGTTT" # divergent
+              ) 
+
+plots <- lapply(var.list, function(x) {
+  subset <- umap.df %>% subset(clone_id == x)
+  umap <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(color = "grey80", size = 1) +
+    geom_point(data = subset, size = 1, aes(color = cell_cluster)) + 
+    scale_color_manual(values = clusterpal)  + plot.theme.umap + NoLegend()
+
+   umap %>% return()
+   
+})
+
+do.call(plot_grid, c(plots, ncol = 5))
+
+```
+
+# Cl13 day chronic : plot Top Clones on UMAP 
+```{r}
+# select some of the top clones from each behavior 
+clone.df.cl13chronic %>% group_by(Clone_Behavior) %>% slice_max(n = 5, order_by = CloneSize)# %>% select(CloneSize, Clone_Behavior, clone_id)
+
+# dim recution plots
+umap.df <- data.frame(so@meta.data,  so@reductions$umap@cell.embeddings)
+
+# vector of clones
+var.list <- c("Cl13 d21-26_CR119_5_TRB:TGTGCTAGCAGTTTAGTGAGTCAAAACACCTTGTACTTT;TRA:TGTGCTATGTCTTCTGGCAGCTGGCAACTCATCTTT", #term
+              "Cl13 d21-26_CR82_2_TRB:TGTGCCAGCAGCTTATGGGGGGGTGCAGAAACGCTGTATTTT;TRA:TGTGCTACAGATACGCGATACAACGTGCTTTACTTC", # int
+              "Cl13 d21-26_CR119_3_TRB:TGTGCCTGGAGGGACTGGGAGAACACCGGGCAGCTCTACTTT;TRA:TGTGCAGCAAGCCCCTCGAACACGGGTTACCAGAACTTCTATTTT", # klr
+              "Cl13 d21-26_CR119_1_TRB:TGTGCCAGCAGCTCCGGGTGGGAACAGTACTTC;TRA:TGTGCTACCCATGACACAAATGCTTACAAAGTCATCTTT", # prog
+              "Cl13 d21-26_CR119_1_TRB:TGTGCCAGCAGTATAAAGGGGGGCTCCTATGCTGAGCAGTTCTTC;TRA:TGTGCTATGACCAACTATGGAAATGAGAAAATAACTTTT"  #Divergent
+              ) 
+
+plots <- lapply(var.list, function(x) {
+  subset <- umap.df %>% subset(clone_id == x)
+  umap <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(color = "grey80", size = 1) +
+    geom_point(data = subset, size = 1, aes(color = cell_cluster)) + 
+    scale_color_manual(values = clusterpal)  + plot.theme.umap + NoLegend()
+
+   umap %>% return()
+   
+})
+
+do.call(plot_grid, c(plots, ncol = 5))
+
+```
+
+
+# clone sizes of different behaviors
+```{r}
+clone.pal <- c("Tcm / Tem_1 Bias" = "#5CB865", 
+               "Tcm Bias" = "#65c7ca",
+               "Tem_1 Bias" = "#f8a523",
+               "Tem_2 Bias" = "#f6d13a",
+               "Divergent" = "#e6af7c",
+               "Tex-Term Bias" = "#b31e0e",
+               "Tex-Prog Bias" = "#a94d9a",
+               "Tex-KLR Bias" = "#E27E73",
+               "Tex-Int Bias"  = "#de311e",
+               "Tex Bias" = "#de311e"
+               )
+
+clone.df <- rbind(
+  select(clone.df.cl13chronic, clone_id, CloneSize, CloneFreq, Clone_Behavior),
+  select(clone.df.Cl13Cleared, clone_id, CloneSize, CloneFreq, Clone_Behavior)) %>% 
+  separate("clone_id", into = c("Group", "Experiment", "Rep", "cdr3s_nt"), sep = "_")
+  
+clone.df$Group%>% table
+
+
+clone.df %>% ggplot(aes(x = fct_reorder(paste(Group, Clone_Behavior,sep = "---"), CloneFreq), y = log2(CloneFreq))) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, aes(color = Clone_Behavior), show.legend = F) + 
+  # facet_grid(~Group) +
+  ggforce::facet_row("Group", scales = "free") +
+  plot.theme + theme(strip.background = element_blank()) +  
+  scale_x_discrete(labels = function(x) gsub(".*---", "", x)) + 
+  scale_color_manual(values = clone.pal) + coord_flip() +
+  labs(x = element_blank(), y = "Log2 Clone Freq")
+  
+
+
+```
+
+
+
+

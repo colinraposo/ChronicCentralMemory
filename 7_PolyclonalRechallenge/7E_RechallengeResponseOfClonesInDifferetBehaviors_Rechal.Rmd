@@ -1,0 +1,792 @@
+# in this notebook, we are comapring the in vivo response of T cell clones from cTcm-biased and other clonal behaviors after Arm rechallenge
+
+# load common libraries 
+```{r}
+suppressPackageStartupMessages({
+
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(data.table)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  library(MetBrewer)
+  
+})
+```
+
+# read in seruat object and set paths
+```{r}
+
+path <- "~/ChronicMemoryGithub_Submission/7_PolyclonalRechallenge/data/"
+outs <- paste0(path, "/3_CloneAnalysis/outs")
+so <- paste0(path, "/7C_SeuratObject_ClusteredAndIDd.rds") %>% readRDS()
+
+DimPlot(so)
+
+```
+
+# remove genes function
+```{r}
+#function to remove TCR genes from VF lists
+remove_genes <- function(features, species, tcr=TRUE, ig=TRUE, cell_cycle=TRUE, mito=TRUE, histone=TRUE, ribosome=TRUE) {
+    print(paste("Before filtering:", length(features), "features"))
+
+    if (species == "human") {
+        if (tcr) {
+            features <- features[!grepl("^TR[ABGD][VDJC]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^IG[HLK][VDJC]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% unlist(cc.genes))]
+        }
+        if (mito) {
+            features <- features[!grepl("^MT-", features)]
+        }
+    }
+    if (species == "mouse") {
+        if (tcr) {
+            features <- features[!grepl("^Tr[abgd][vdjc]", features)]
+        }
+        if (tcr) {
+            features <- features[!grepl("^Tcr[abgd][vdjc]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^Ig[hlk][vdjc]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% stringr::str_to_title(unlist(cc.genes)))]
+        }
+        if (mito) {
+            features <- features[!grepl("^Mt-", features)]
+        }
+      
+       if (histone) {
+            features <- features[!grepl("^Hist", features)]
+       }
+      
+       if (ribosome) {
+            features <- features[!grepl("^Rps", features)]
+       }
+      
+      if (ribosome) {
+            features <- features[!grepl("^Rpl", features)]
+        }
+      
+    }
+
+    print(paste("After filtering:", length(features), "features"))
+    
+    return(features)
+}
+
+DefaultAssay(so) <- "integrated"
+vf.clean <- remove_genes(VariableFeatures(so), species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+DefaultAssay(so) <- "RNA"
+```
+
+# plot aesthetics
+```{r}
+plot.theme.umap <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5), 
+        # panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.5, color = "grey80"),
+        axis.text = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "plain")) 
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"), 
+                                      strip.background = element_rect(fill = "transparent"), strip.text = element_text(size = 14),)
+
+plot.theme.2 <- theme_bw() + 
+  theme(plot.title = element_text(hjust =  0.5 , size = 14, color = "black"),
+        plot.subtitle = element_text(hjust = 0.5 , size = 10, color = "black"), 
+        axis.text = element_text(color = "black", size = 12),
+        axis.title = element_text(size = 12),
+        axis.ticks = element_line(color = "black", linewidth = 0.7), 
+        strip.background = element_blank(), strip.text = element_text(hjust = 0, size = 11),
+        panel.border = element_rect(colour = "black", linewidth = 0.7),
+        panel.grid = element_blank()
+        )
+
+group.pal <- c("Cl13:Arm" = "#932728", 
+               "Arm:Arm" = "#65C7CA",
+               "ChrMem" = "#932728", 
+               "AcuMem" = "#65C7CA")
+
+clusterpal <- c(   
+  "SLEC_1" = "#014f63",
+  "SLEC_2" = "#62939a",
+  "Eff_Mem" = "#65c7ca",
+  "MPEC" = "#122452",
+  "Exh_Eff" = "#ef8577",
+  "Exh_EM" = "#e62230",
+  "Exh_Term" = "#a11822",
+  "Prolif_1" = "#f6d13a",    
+  "Prolif_2" = "#f26e36",   
+  "ISG" = "#e6af7c"
+  )
+
+d8.clone.pal <- c(
+  "Eff_Mem" = "#65c7ca",
+  "SLEC_2" = "#62939a",
+  "SLEC_1" = "#014f63",
+  "Exh_EM" =  "#e62230",
+  "Exh_Eff" = "#ef8577"
+  )
+
+d0.clone.pal <- c(
+  "aTcm Bias 1" = "#0067AA",
+  "aTcm Bias 2" = "#000080",
+  "aTem Bias" = "#e6af7c",
+  "aTtem Bias" = "#f26e36",
+  
+  "cTcm Bias" = "#65c7ca",
+  "cTem Bias 1" = "#f8a523", 
+  "cTem Bias 2" = "#f6d13a" , 
+  "Tex-Prog Bias" = "#a94d9a",
+  "Tex-Term Bias" = "#a11822" ,
+  
+  "Endo GP33+" = "grey70"
+  )
+
+sortpal <- c(
+  "aTcm" = "#03509a", 
+  "aTem" = "#e6af7c", 
+  "aTtem" = "#f26e36",
+  
+  "cTcm"= "#65c7ca",
+  "cTem" = "#f6d13a", 
+  "Tex-Prog" = "#a94d9a",
+  "Tex-Term" = "#b31e0e"
+  
+)
+
+  
+DimPlot(so, cols = clusterpal)
+
+```
+
+# create a dataframe quanitifying the # of cells per clone at day 8 
+```{r}
+# select rechallenge clones only + add in cell #s (based on counting beads) + convert % of cells to total cell count
+## cell counts calculated on a per mouse bases
+d8.size.df <- so@meta.data %>% filter(Group %in% c("ChrMem", "AcuMem")) %>%
+  dplyr::count(Group, Tet_Group, Rep, cdr3s_nt, chains) %>% mutate(Rep = paste(Tet_Group, Rep, sep = "_")) %>% 
+  merge(read_csv(paste0(path, "/CellNumbersFrom10X.csv")), by = "Rep") %>% 
+  group_by(Rep) %>% mutate(Freq = n / sum(n)) %>% mutate(Count = Freq * CellNumber)
+
+# check correation between freq and counts
+d8.size.df %>% ggplot(aes(x = Count, y = Freq)) + 
+  geom_point(alpha = .5, size = 0.5) + 
+    facet_wrap(~Rep, scales = "free") + 
+    stat_cor() + ggtitle("Day 8 clones")
+
+# separate TCR into Alpha and Beta chains 
+d8.size.df <- d8.size.df %>% ungroup() %>% 
+  separate(cdr3s_nt, sep = ";", into = c("TRB", "TRA"), remove = F) %>% 
+  mutate(TRB = substr(TRB, 5, nchar(TRB)), TRA = substr(TRA, 5, nchar(TRA))) %>%
+  mutate(TRB = ifelse(is.na(TRB), "NA", TRB)) %>% mutate(TRA = ifelse(is.na(TRA), "NA", TRA)) 
+
+# filter out only A/B TCR chain pains
+table(d8.size.df$chains)
+d8.size.df <-d8.size.df %>% filter(chains == "ab")
+table(d8.size.df$chains)
+
+# remove spare nucleotides added to the CDR3 by CellRanger to merge with bTCR data + add on Group ID
+d8.size.df <- d8.size.df %>% mutate(TRB_CDR3 = paste(Group, substr(d8.size.df$TRB, 4, nchar(d8.size.df$TRB) - 3), sep = "_"))
+
+# check overlaps between samples 
+## tetramer sorts are NOT mutaually exlusive
+m <- split(d8.size.df$TRB_CDR3, d8.size.df$Tet_Group) %>% 
+  make_comb_mat() 
+m %>% UpSet(top_annotation = upset_top_annotation(m, add_numbers = T), height = unit(5, "cm"),width = unit(5, "cm"))
+
+# sum of total clone size by adding # of cells in a clone isolated per clone per mouse together
+d8.size.df <- d8.size.df %>% ungroup() %>% group_by(Group, TRB_CDR3) %>% summarise(Count = sum(Count))
+
+d8.size.df %>% ggplot(aes(x = Count)) + geom_histogram() + facet_wrap(~Group, scales = "free")
+
+```
+
+# import bTCR data from pre-rechallenge
+```{r}
+# Specify the directory path and get all files in the directory
+bTCR_datapath <- paste0(path, "bTCR_rawdata")
+
+samples <- list.files(path = bTCR_datapath)
+
+# read in all csvs and append sample ID
+bTCR_raw_list <- lapply(samples, function(x){
+  sample.id <- substr(x, 25, 30)
+  path <- paste0(bTCR_datapath, "/TCRrechalenge_Processed_" , sample.id , "_pep.csv")
+  data <- read.csv(path)
+  data$Sample.id <- sample.id
+  return(data)
+}) 
+
+# append all TCR raw data together
+bTCR_rawdata <-  do.call(rbind, bTCR_raw_list)
+
+# read in sample IDs and append to bTCR_rawdata
+sample.id <- read.csv(paste0(path, "bTCR_SampleIDs.csv")) %>% dplyr::select(Sample, Sample.id)
+
+bTCR_rawdata <- merge(bTCR_rawdata, sample.id, by = "Sample.id") %>% 
+  mutate(CDR3.nuc.= toupper(CDR3.nuc.)) # make CDR3 all upper case to make futures things easier
+
+# check number of TCRs per sample
+bTCR_rawdata$Sample %>% table
+
+# select only the cdr3 and count columns
+cdr3.df <- bTCR_rawdata %>% dplyr::select(CDR3.nuc. , copy, Sample) %>%
+  mutate(Rep = ifelse(substr(Sample , nchar(Sample) -1, nchar(Sample)) == "_r", "R2", "R1")) %>%  # add replicate column
+  mutate(Sample = ifelse(Rep == "R2", substr(Sample, 1, nchar(Sample) -2), Sample))  # remove replicate from sample ID
+                    
+# QC check on replicate samples
+## everything looks highly concordant between replicates, the one exception is chronic Tcm
+## possible explanation: very few CXCR3+ CD62L+ cells that are Ag specific so many of these cells will be non-ag specific 
+cdr3.df %>% pivot_wider(id_cols = c(CDR3.nuc. , Sample), values_from = copy, names_from = Rep, values_fn = {sum}) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) %>%
+  ggplot(aes(x = R1, y = R2)) + 
+    geom_point(alpha = .5, size = 0.5) + 
+    geom_smooth(method = "lm", color = "red", fill = "transparent") +
+    facet_wrap(~Sample, scales = "free") + 
+    stat_cor() + scale_x_log10() + scale_y_log10() + theme_bw() + ggtitle("all clones")
+
+# only clones in both replicates
+cdr3.df %>% pivot_wider(id_cols = c(CDR3.nuc. , Sample), values_from = copy, names_from = Rep, values_fn = {sum}) %>%  
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) %>% 
+  filter(R1 > 0, R2 > 0, Sample != "PosCtrl_m20210506") %>%
+  ggplot(aes(x = R1, y = R2)) + 
+    geom_point(alpha = .5, size = 0.5) + 
+    geom_smooth(method = "lm", color = "red", fill = "transparent") +
+    facet_wrap(~Sample) + 
+    stat_cor() + scale_x_log10() + scale_y_log10() + theme_bw() + 
+  ggtitle(label = "filtered clones", subtitle = "Clone > 0 in each replicate")
+
+# make vector only where clone is in both replicates
+both.rep.clones <- cdr3.df %>% pivot_wider(id_cols = c(CDR3.nuc. , Sample), values_from = copy, names_from = Rep, values_fn = {sum}) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) %>% 
+  filter(R1 >0, R2 > 0) %>% 
+  select(CDR3.nuc.) %>% c()
+
+# create new d0.clone.df with average reads per sample
+d0.clone.df <- cdr3.df %>% filter(Sample != "PosCtrl_m20210506", CDR3.nuc. %in% both.rep.clones$CDR3.nuc.) %>% # remove postive control, select only shared clones
+  group_by(Rep, Sample, CDR3.nuc.) %>% mutate(ReadFrac = sum (copy)) %>% ungroup() %>% # any TCRs with the same CDR3 add together
+  group_by(Rep, Sample) %>% mutate(ReadFrac = copy / sum (copy)) %>% # convert copies to fraction of reads
+  ungroup() %>% group_by(Sample, CDR3.nuc.) %>% select(-c(Rep, copy)) %>% summarise(ReadFrac = mean(ReadFrac)) # average read fraction between the two reads
+  
+# add cell counts, based on counts
+d0.clone.df <- merge(d0.clone.df, read.csv(paste0(path, "bTCR_CellCounts.csv"))) %>%
+  select(-FreqOfCD8) %>%
+  mutate(NumberIsolated = ReadFrac * NumberIsolated,
+         NumberXferedPerMouse = ReadFrac * NumberXferedPerMouse, 
+         NumberXferedTotal = ReadFrac * NumberXferedTotal) %>% 
+  separate(Sample, into = c("EXP" , "Timepoint", "Group", "Sort")) %>% 
+  ungroup() 
+
+# merge CDR3 and group for merging with 10X data - add total clone size
+d0.clone.df <- d0.clone.df %>% mutate(Group = ifelse(Group == "Acute", "AcuMem", "ChrMem")) %>%
+  mutate(TRB_CDR3 = paste0(Group, "_", CDR3.nuc.)) %>% 
+  select(Group, Sort, TRB_CDR3, NumberXferedTotal) %>% 
+  mutate(SortCount = NumberXferedTotal) %>% select(-NumberXferedTotal) %>%
+  group_by(TRB_CDR3) %>% mutate(TotalCount = sum(SortCount))
+
+# change metadata for sorts
+d0.clone.df$Sort[d0.clone.df$Sort == "CM"] <- "aTcm"
+d0.clone.df$Sort[d0.clone.df$Sort == "EM"] <- "aTem"
+d0.clone.df$Sort[d0.clone.df$Sort == "CX3CR1" & d0.clone.df$Group == "AcuMem"] <- "aTtem"
+
+d0.clone.df$Sort[d0.clone.df$Sort == "Tcm"] <- "cTcm"
+d0.clone.df$Sort[d0.clone.df$Sort == "Prog"] <- "Tex-Prog"
+d0.clone.df$Sort[d0.clone.df$Sort == "Term"] <- "Tex-Term"
+d0.clone.df$Sort[d0.clone.df$Sort == "CX3CR1" & d0.clone.df$Group == "ChrMem"] <- "cTem"
+
+table(d0.clone.df$Sort, d0.clone.df$Group)
+  
+```
+
+# Clustering for pre-rechallenge clones to determine pre-rechallenge clonal behavior
+```{r}
+# CHRONIC ++++++++++++++++++++++++++++++++++++++++++++++ ++++++++++++++++++++++++++++++++++++++++++++++
+
+# make d0.clone.prop defining the proportion of each clone in each sort
+d0.clone.prop.cl13 <- d0.clone.df %>% filter(Group == "ChrMem") %>%
+  filter(TRB_CDR3 %in% d8.size.df$TRB_CDR3) %>% 
+  mutate(freq = SortCount / TotalCount) %>% 
+  select(Sort, TRB_CDR3, freq, TotalCount) %>% pivot_wider(names_from = Sort, values_from = freq) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .)))
+
+
+# cluster clones
+set.seed(13)
+clusters <- d0.clone.prop.cl13 %>% ungroup %>% select(-c(TRB_CDR3, TotalCount)) %>% kmeans(centers = 5)
+
+d0.clone.prop.cl13$cluster <- paste0("C", clusters$cluster)
+
+d0.clone.prop.cl13$cluster[d0.clone.prop.cl13$cluster == "C1"] <- "cTcm Bias"
+d0.clone.prop.cl13$cluster[d0.clone.prop.cl13$cluster == "C2"] <- "cTem Bias 2"
+d0.clone.prop.cl13$cluster[d0.clone.prop.cl13$cluster == "C3"] <- "Tex-Term Bias"
+d0.clone.prop.cl13$cluster[d0.clone.prop.cl13$cluster == "C4"] <- "Tex-Prog Bias"
+d0.clone.prop.cl13$cluster[d0.clone.prop.cl13$cluster == "C5"] <- "cTem Bias 1"
+
+
+# vizualize clone clusters on heatmap
+
+size.annot <- rowAnnotation(size = anno_barplot(d0.clone.prop.cl13$TotalCount %>% log10))
+sort.annot <- columnAnnotation(` ` = colnames(d0.clone.prop.cl13 %>% ungroup %>% select(-c(TRB_CDR3, TotalCount, cluster))),
+                             col = list(` ` = sortpal), show_legend = F)
+
+d0.clone.prop.cl13 %>% ungroup %>% select(-c(TRB_CDR3, TotalCount, cluster)) %>% 
+  Heatmap(name = "Frac of Clone",
+          show_row_names = F, border = T, 
+          show_row_dend = F, show_column_dend = T, row_title_rot = 0, column_dend_height = unit(0.2, "cm"), 
+          col= brewer.pal(9, "Purples"), 
+          split = d0.clone.prop.cl13$cluster,
+          right_annotation = size.annot,
+          top_annotation = sort.annot,
+          column_names_rot = 45,
+          height = unit(6, "cm"),width = unit(0.8*4, "cm"))
+
+
+# Acute ++++++++++++++++++++++++++++++++++++++++++++++ ++++++++++++++++++++++++++++++++++++++++++++++
+
+# make d0.clone.prop defining the proportion of each clone in each sort
+d0.clone.prop.arm <- d0.clone.df %>% filter(Group == "AcuMem") %>%
+  filter(TRB_CDR3 %in% d8.size.df$TRB_CDR3) %>% 
+  mutate(freq = SortCount / TotalCount) %>% 
+  select(Sort, TRB_CDR3, freq, TotalCount) %>% pivot_wider(names_from = Sort, values_from = freq) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .)))
+
+# cluster clones
+set.seed(13)
+clusters <- d0.clone.prop.arm %>% ungroup %>% select(-c(TRB_CDR3, TotalCount)) %>% kmeans(centers = 4)
+
+d0.clone.prop.arm$cluster <- paste0("C", clusters$cluster)
+
+d0.clone.prop.arm$cluster[d0.clone.prop.arm$cluster == "C1"] <- "aTtem Bias"
+d0.clone.prop.arm$cluster[d0.clone.prop.arm$cluster == "C2"] <- "aTem Bias"
+d0.clone.prop.arm$cluster[d0.clone.prop.arm$cluster == "C3"] <- "aTcm Bias 2"
+d0.clone.prop.arm$cluster[d0.clone.prop.arm$cluster == "C4"] <- "aTcm Bias 1"
+
+# visualize clone clusters on heatmap
+
+size.annot <- rowAnnotation(size = anno_barplot(d0.clone.prop.arm$TotalCount %>% log10))
+sort.annot <- columnAnnotation(` ` = colnames(d0.clone.prop.arm %>% ungroup %>% select(-c(TRB_CDR3, TotalCount, cluster))),
+                             col = list(` ` = sortpal), show_legend = F)
+
+d0.clone.prop.arm %>% ungroup %>% select(-c(TRB_CDR3, TotalCount, cluster)) %>% 
+  Heatmap(name = "Frac of Clone",
+          show_row_names = F, border = T, 
+          show_row_dend = F, show_column_dend = T, row_title_rot = 0, column_dend_height = unit(0.2, "cm"),
+          col= brewer.pal(9, "Purples"), 
+          split = d0.clone.prop.arm$cluster,
+          right_annotation = size.annot,
+          top_annotation = sort.annot, column_names_rot = 45,
+          height = unit(6, "cm"),width = unit(0.8*3, "cm"))
+
+```
+
+# clonal expansion of clones between TP
+```{r}
+
+# upset plot of pre-rechallenge and post rechallenge clones
+d0.clones.upset <- rbind(d0.clone.df) %>% select(TRB_CDR3) %>% mutate(Group = paste("Xfer", substr(TRB_CDR3, 1, 6)))
+d8.clones.upset <- d8.size.df %>% filter(Group != "EndoGP33") %>% select(TRB_CDR3) %>% mutate(Group = paste("Day8", substr(TRB_CDR3, 1, 6))) 
+
+upset.df <- rbind(d0.clones.upset, d8.clones.upset)
+
+m <- split(upset.df$TRB_CDR3, upset.df$Group) %>% 
+  make_comb_mat() 
+m %>% UpSet(top_annotation = upset_top_annotation(m, add_numbers = T), height = unit(2.5, "cm"),width = unit(5, "cm"))
+
+
+# r bind chronic and acute memory clones - only those shared between TP
+# calculate clonal expansion by taking fold change day 8 vs day 0
+merged.df <- rbind(d0.clone.prop.arm, d0.clone.prop.cl13) %>%
+  merge(d8.size.df, by = "TRB_CDR3") %>% 
+  dplyr::rename(d0Count = TotalCount, d8Count = Count) %>% 
+  mutate(ClonalExpansion = d8Count / d0Count)
+
+# clone size between TP
+merged.df %>% ggplot(aes(x = log10(d0Count), y = log10(d8Count))) + 
+  geom_point() + stat_cor() +
+  facet_wrap(~Group, scales = "free") 
+
+# clonal expansion of all clones
+plot.df <- merged.df %>% ungroup()%>%  mutate(rank = rank(ClonalExpansion)) %>% arrange(rank) 
+
+plot.df %>% mutate(Group = ifelse(Group == "ChrMem", "Cl13:Arm", "Arm:Arm")) %>%
+  ggplot(aes(x =fct_reorder(TRB_CDR3,ClonalExpansion) , y = log2(ClonalExpansion), fill = Group)) + 
+  geom_col() + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.line.x = element_blank()) + 
+  geom_hline(yintercept = 0) +
+  labs(title = element_blank(), y = "Log2 FC (8 dpi / Transfer)", x = "Individual Clones Ranked by FC") 
+
+
+# plot histogram of distibutions
+plot.df %>% mutate(Group = ifelse(Group == "ChrMem", "Cl13:Arm", "Arm:Arm")) %>% 
+  ggplot(aes(x = log2(ClonalExpansion), fill = Group, color = Group)) + 
+  geom_histogram(aes(y = ..density..), bins = 50, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = group.pal) + scale_color_manual(values = group.pal) + 
+  plot.theme + 
+  scale_y_continuous(expand = expansion(mult = c(0.0, 0.05))) +
+  labs(title = element_blank(), x = "Log2 FC (8 dpi / Transfer)", y = "Density") 
+
+# test the differences in distribution of clonal expansion between groups  
+test.df <- plot.df %>% filter(Group == "ChrMem") 
+x <- var(log2(test.df$ClonalExpansion))
+y <- median(log2(test.df$ClonalExpansion))
+print(paste("Cl13:Arm - variance =", x, "; med =", y))
+
+test.df <- plot.df %>% filter(Group == "AcuMem") 
+x <- var(log2(test.df$ClonalExpansion))
+y <- median(log2(test.df$ClonalExpansion))
+print(paste("Arm:Arm - variance =", x, "; med =", y))
+
+# Mann whitney
+test.results <- wilcox.test(log2(ClonalExpansion) ~ Group, data = plot.df, center = "median")
+test.results
+
+library(car) # Brown-Forsythe test to compare variance - use levene test but on median not mean
+test.results <- leveneTest(log2(ClonalExpansion) ~ Group, data = plot.df, center = "median")
+test.results
+
+# number of Cl13 clones >= median of Arm
+median.arm <- filter(plot.df, Group == "AcuMem")$ClonalExpansion %>% log2 %>% median
+
+x <- filter(plot.df, Group == "ChrMem")
+y <- filter(plot.df, Group == "ChrMem") %>% filter(log2(ClonalExpansion) >= median.arm)
+
+print(paste0("total=", x$TRB_CDR3 %>% length, "; >= arm med=", y$TRB_CDR3 %>% length))
+
+```
+
+# clonal expansion of clones of different behaviors
+```{r}
+# cComaprison of Cl13:Arm behaviors
+plot.chron <- merged.df %>% filter(Group == "ChrMem") %>% 
+  ggplot(aes(x = fct_reorder(cluster, ClonalExpansion), y = log2(ClonalExpansion))) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(width = 0.2, aes(color = cluster), show.legend = F, size = 1.4) + 
+  plot.theme +  rotate_x_text(45) +
+  labs(y = "Log2 FC (8 dpi / Transfer)" , x = "d0 Clone Behavior", tite = "Cl13:Arm Clones") +
+  scale_color_manual(values = d0.clone.pal) +
+  stat_compare_means(method = "wilcox.test", 
+                       comparisons = list(c("cTcm Bias" , "Tex-Prog Bias"), c("cTcm Bias" , "Tex-Term Bias"), 
+                                          c("cTcm Bias" , "cTem Bias 1"), c("cTcm Bias" , "cTem Bias 2")),
+                       tip.length = 0) + 
+  scale_y_continuous(limits = c(-1, 19))
+
+# cTcm vs acute behaviors
+plot.acute <- merged.df %>% filter(cluster %in% c("cTcm Bias" , "aTcm Bias 1" , "aTcm Bias 2", "aTtem Bias", "aTem Bias")) %>% 
+  mutate(cluster = factor(cluster, levels =c("cTcm Bias", "aTtem Bias", "aTem Bias","aTcm Bias 2", "aTcm Bias 1"))) %>%
+  ggplot(aes(x = cluster, y = log2(ClonalExpansion))) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(width = 0.2, aes(color = cluster), show.legend = F, size = 1.4) + 
+  plot.theme + rotate_x_text(45) + 
+  labs(y = "Log2 FC (8 dpi / Transfer)" , x = "d0 Clone Behavior", tite = "Tcm Biased Clones") +
+  scale_color_manual(values = d0.clone.pal) +
+  stat_compare_means(method = "wilcox.test", 
+                       comparisons = list(c("cTcm Bias" , "aTcm Bias 1"), c("cTcm Bias" , "aTcm Bias 2"), 
+                                          c("cTcm Bias" , "aTem Bias"), c("cTcm Bias" , "aTtem Bias")),
+                       tip.length = 0) + 
+  scale_y_continuous(limits = c(-1, 19))
+
+plot_grid(plot.chron, plot.acute, align = "h", axis = "b")
+
+```
+
+# merge together day 8 and day 0 clonal data and 10X data - clonesize only
+```{r}
+# add clone size infor
+d8.clones.all <- so@meta.data %>% 
+    separate(cdr3s_nt, sep = ";", into = c("TRB", "TRA"), remove = F) %>% 
+    filter(!is.na(TRB_nt)) %>%
+    mutate(TRB_CDR3 = ifelse(is.na(TRB_nt) & chains == "ab", NA, paste(Group, substr(TRB_nt, 4, nchar(TRB_nt) - 3), sep = "_"))) 
+
+# add clone size (just 10X counts)
+d8.clones.all <- d8.clones.all %>% dplyr::count(TRB_CDR3, name = "CloneSize_10X") %>% merge(d8.clones.all)
+
+```
+
+
+
+# cluster distribution per clone behavior (as fraction of total cells)
+```{r}
+# new dataframe with all cells - group them by TCRB - same as used for the over time analysis
+d8.df <- so@meta.data %>% 
+    separate(cdr3s_nt, sep = ";", into = c("TRB", "TRA"), remove = F) %>% 
+    filter(!is.na(TRB_nt)) %>%
+    mutate(TRB_CDR3 = ifelse(is.na(TRB_nt) & chains == "ab", NA, paste(Group, substr(TRB_nt, 4, nchar(TRB_nt) - 3), sep = "_"))) 
+# add clone size (10X counts) and filter only exp clopnes
+d8.df <- d8.clones.all %>% dplyr::count(TRB_CDR3, name = "CloneSize_10X") %>% merge(d8.clones.all) %>% filter(CloneSize_10X > 4)
+
+# determine proporton of each clonal cluster after rechalleng
+d8.df %>% select(TRB_CDR3, cell_cluster) %>% 
+  full_join(merged.df %>% ungroup %>% select(TRB_CDR3, cluster), by = "TRB_CDR3") %>% dplyr::rename(d0cluster = cluster) %>% 
+  mutate(d0cluster = if_else(d0cluster %in% c("aTcm Bias 1", "aTcm Bias 2" , "aTem Bias", "aTtem Bias"), "Arm:Arm", d0cluster)) %>%
+  filter(!is.na(d0cluster), !is.na(cell_cluster)) %>% 
+  dplyr::count(d0cluster, cell_cluster) %>% 
+  group_by(d0cluster) %>% mutate(Freq = n/sum(n)) %>% 
+  ggplot(aes(x = Freq*100, y =d0cluster, fill = cell_cluster)) + 
+    geom_col(show.legend = F) + 
+    scale_fill_manual(values = clusterpal) + 
+    plot.theme + 
+    labs(y = "d0 Clone Behavior", x = "% of Progeny (8 dpi)") + 
+    scale_x_continuous(expand = expansion(mult = c(0.0, 0.05)))
+  
+# ggsave("3J - ClusterDist_CloneBehaviors.pdf", height = 2.2, width = 4.5, path = outs)
+```
+
+# output of indidivudal clones from Cl13:Arm group
+```{r}
+# get all C13:Arm clones and summarize phenotype distribution in clone
+d8.clones <- d8.df %>% select(TRB_CDR3, cell_cluster, barcode) %>% 
+  full_join(merged.df %>% ungroup %>% select(TRB_CDR3, cluster), by = "TRB_CDR3") %>% dplyr::rename(d0cluster = cluster) %>% 
+  # mutate(d0cluster = if_else(d0cluster %in% c("aTcm Bias 1", "aTcm Bias 2" , "aTem Bias", "aTtem Bias"),"aTcm Bias", d0cluster)) %>%
+  filter(!is.na(d0cluster), !is.na(cell_cluster)) %>%
+  dplyr::count(TRB_CDR3, d0cluster, cell_cluster) %>%
+  group_by(TRB_CDR3) %>% mutate(freq = n / sum(n)) %>%ungroup()
+
+# add freq in Non-Exh Clusters
+d8.clones <- d8.clones %>% filter(cell_cluster %in% c("SLEC_1", "SLEC_2", "Eff_Mem", "MPEC")) %>% 
+  group_by(TRB_CDR3) %>% summarise(FreqNonExh = sum(freq)) %>% arrange(FreqNonExh) %>%
+  full_join(d8.clones) %>% mutate(FreqNonExh = ifelse(is.na(FreqNonExh), 0, FreqNonExh))
+
+d8.clones <- d8.clones %>% filter(cell_cluster %in% c("Exh_Eff", "Exh_EM", "Exh_Term")) %>% 
+  group_by(TRB_CDR3) %>% summarise(FreqExh = sum(freq)) %>% arrange(FreqExh) %>%
+  full_join(d8.clones) %>% mutate(FreqExh = ifelse(is.na(FreqExh), 0, FreqExh))
+ 
+
+top.15.clones <- d8.clones %>% filter(!d0cluster %in% c("aTem Bias", "aTtem Bias", "aTcm Bias 1", "aTcm Bias 2"))  %>%
+  group_by(TRB_CDR3, d0cluster) %>% summarise(clonesize = sum(n)) %>% ungroup() %>% group_by(d0cluster)%>% slice_max(n = 15, with_ties = F, order_by = clonesize)
+
+d8.clones %>% filter(!d0cluster %in% c("aTem Bias", "aTtem Bias", "aTcm Bias 1", "aTcm Bias 2")) %>%
+  filter(TRB_CDR3 %in% top.15.clones$TRB_CDR3) %>%
+  ggplot(aes(x = fct_reorder(TRB_CDR3, FreqNonExh), y = freq, fill = cell_cluster)) + 
+  geom_col(show.legend = F) + 
+  ggforce::facet_row(~d0cluster, scales = "free_x", space = "free") + 
+  plot.theme +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) + 
+  scale_y_continuous(expand = expansion(mult = c(0.0, 0.05))) + scale_fill_manual(values = clusterpal) + 
+  labs(x = "15 Largest Clones per Behavior" , y = "Fraction of Clones")
+
+
+```
+
+# non linear regression of chances that a clone is "exhausted" (aka >50% exhausted)
+```{r}
+# non-linear regression to determine freq in non-exhausted clusters
+regress.df <- d8.clones %>% 
+  filter(!d0cluster %in% c("aTem Bias", "aTtem Bias", "aTcm Bias 1", "aTcm Bias 2")) %>%
+  pivot_wider(names_from = cell_cluster, values_from = freq, id_cols = c(TRB_CDR3, FreqNonExh, d0cluster,FreqExh)) %>% 
+  select(TRB_CDR3, FreqNonExh, d0cluster, FreqExh) %>%
+  mutate(full_exh = ifelse(FreqExh > 0.5, 1, 0))
+
+# plot % of clone in non-exhausted clusters
+regress.df %>% 
+  ggplot(aes(x = FreqExh, y = d0cluster)) + 
+  geom_boxplot() + 
+  geom_jitter(aes(color = as.factor(full_exh)), width = 0, height = 0.1)
+
+# Run logistic regression model with Clone_Behavior as the predictor, and CloneSize as a covariate
+model <- glm(full_exh ~ d0cluster, data = regress.df, family = binomial)
+summary(model)
+
+# Create new data frame with unique values of pre-rechallenge behavior and generate predictions based on Behavior
+new_data <- data.frame(d0cluster = unique(regress.df$d0cluster)) 
+predictions <- predict(model, new_data, type = "response", se.fit = TRUE)
+
+# Store predictions and standard errors in the new data frame
+new_data$fit <- predictions$fit
+new_data$se.fit <- predictions$se.fit
+
+# Calculate maximum y-value for plotting (95% confidence interval)
+max_y <- max(new_data$fit + 1.96 * new_data$se.fit, na.rm = TRUE)
+
+# pairwise comparisions
+library(emmeans)
+emm <- emmeans(model, ~ d0cluster, )
+pairs_df <- as.data.frame(pairs(emm)) %>%
+  separate(contrast, into = c("group1", "group2"), sep = " - ") %>%
+  select(group1, group2, p.value) 
+pairs_df
+
+# plot comparisons
+ggplot(data = new_data, aes(x = fct_reorder(d0cluster, fit), y = fit, color = d0cluster)) +
+ geom_point(size = 2.5) + 
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey80") +
+  geom_errorbar(aes(ymin = fit - 1.96 * se.fit, ymax = fit + 1.96 * se.fit, width = 0.2), width = 0.25) + # 95% confidence interval
+  plot.theme +
+  ylim(NA, max_y * 1.4) +
+  ylab("Predicted Probability of Exh Clone") +
+  xlab("Pre-Transfer Clone Behaviors") + ggtitle("") +
+  theme(legend.position = "none")  + rotate_x_text(45) + 
+  scale_color_manual(values = d0.clone.pal)
+
+
+```
+
+
+# clonal bias of a score function - calculates if cells of a single clone are signifcicantly different from a total distribution
+# this analysis is taken from Jeff Mold et al Cell Reports 2021 (https://www.cell.com/cell-reports/pdf/S2211-1247(21)00519-2.pdf)
+```{r}
+#function to determine if individual clones are significantly different from the total distribution, by a single variable (score) by mann-whitney test
+#requires a data frame (x) "TRB_CDR3" and a score column
+clonal_bias_calc_mannwhitney <- function(x, variable) {
+        all_cells <- data.frame(x) %>% ungroup()
+        names(all_cells)[which(colnames(all_cells) == variable)] <- "score"
+        exp_clones <- filter(all_cells, !is.na(d0cluster), CloneSize_10X > 4) # only select clones >4 cells
+        
+        #split exp clones by each clone
+        sum.df <- group_split(exp_clones, TRB_CDR3) %>%
+           lapply(FUN = function(x){
+              all.cells <- data.frame(id = 0, score = all_cells$score)
+              clone.cells <- data.frame(id = 1, score = x$score)
+              data <- rbind(all.cells, clone.cells)
+              mann.whitney <- wilcox.test(score ~ id, data=data) 
+              # return(mann.whitney)
+              #create a new dataframe for each clone merging each clone by its shared informnation + median score
+              x <- data.frame(mann.whitney$p.value, unique(x$TRB_CDR3), median(x$score), unique(x$d0cluster))    
+           }) %>%
+             do.call(rbind, .)
+      
+        #rename columns in dataframe
+        colnames(sum.df) <- c("P.Val" , "TRB_CDR3" , "Median", "d0Cluster")
+        
+        # add adjusted p value
+        sum.df$P.Adj <- p.adjust(sum.df$P.Val, method = "BH")
+      
+        # #add column to summarize significance
+        sum.df$P.Sig[sum.df$P.Adj > 0.05] <- "ns"
+        sum.df$P.Sig[sum.df$P.Adj <= 0.05] <- format(sum.df$P.Adj[sum.df$P.Adj < 0.05], scientific = T, digits = 3)
+        sum.df$Sig.Sum[sum.df$P.Adj > 0.05] <- " "
+        sum.df$Sig.Sum[sum.df$P.Adj <= 0.05] <- "*"
+        sum.df$Sig.Sum[sum.df$P.Adj < 0.01] <- "**"
+        sum.df$Sig.Sum[sum.df$P.Adj < 0.001] <- "***"
+        return(sum.df)
+      }
+
+# make new dataframe (x) with all cells, their clone behavior, and their clone size
+all.cells <- so@meta.data %>% 
+    separate(cdr3s_nt, sep = ";", into = c("TRB", "TRA"), remove = F) %>% 
+    mutate(TRB_CDR3 = ifelse(is.na(TRB_nt) & chains == "ab", NA, paste(Group, substr(TRB_nt, 4, nchar(TRB_nt) - 3), sep = "_"))) %>%
+  full_join(merged.df %>% ungroup %>% select(TRB_CDR3, cluster), by = "TRB_CDR3") %>% dplyr::rename(d0cluster = cluster)
+
+# add clone size for filtering (10X counts)
+all.cells <- all.cells %>% dplyr::count(TRB_CDR3, name = "CloneSize_10X") %>% merge(all.cells)
+
+# need for plots - median of all chr mem cells
+median.eff <- median(all.cells$Teff_Module3[all.cells$Group == "ChrMem"])
+
+# calculate clonal bias based on its Teff Module
+output.eff <- all.cells %>% filter(Group == "ChrMem") %>%
+  clonal_bias_calc_mannwhitney(variable = "Teff_Module3") 
+
+plot.df.eff <- filter(all.cells, !is.na(d0cluster), !is.na(TRB_CDR3), CloneSize_10X > 4, Group == "ChrMem") %>% 
+  select(TRB_CDR3, Teff_Module3, CloneSize_10X, barcode) %>% 
+  full_join(output.eff, by = "TRB_CDR3")
+
+
+```
+
+# plot out individual clones effector score
+```{r}
+# create plot.df with only the data that we want to plot
+plot.df <- plot.df.eff %>% select(TRB_CDR3, Teff_Module3, CloneSize_10X, Sig.Sum, barcode, d0Cluster, P.Val) %>% 
+                   dplyr::rename(Eff.Module = Teff_Module3, Sig.Sum.Eff = Sig.Sum , P.Eff = P.Val)
+
+clones.to.plot <- plot.df %>% dplyr::count(TRB_CDR3, d0Cluster) %>% group_by(d0Cluster) %>% slice_max(n = 10, order_by = n)
+
+# create new DF to plot p values
+pval.df <- plot.df %>% filter(TRB_CDR3 %in% clones.to.plot$TRB_CDR3) %>% group_by(TRB_CDR3, d0Cluster) %>%
+  summarise(Sig.Sum.Eff = first(Sig.Sum.Eff), Eff.Module = median(Eff.Module))
+
+# create plots of individual clones
+main <- plot.df %>% filter(TRB_CDR3 %in% clones.to.plot$TRB_CDR3) %>%
+  ggplot(aes(x = Eff.Module, y = fct_reorder(TRB_CDR3, Eff.Module))) + 
+    geom_vline(xintercept = median.eff) +
+    geom_point(size = 1.5, aes(color = d0Cluster), show.legend = F, alpha = 0.7) + 
+    stat_summary(fun = median, geom = "crossbar", size = 0.3, width = 0.8) +
+    scale_color_manual(values = d0.clone.pal) +
+    # geom_text(data = pval.df, aes(label = Sig.Sum.Eff.Good, color = d0Cluster), x = 1.55, angle = 0, show.legend = F) +
+    plot.theme.2 + rotate_x_text(0) + theme(axis.ticks.y = element_blank(), axis.text.y = element_blank()) +
+    labs(y = "Individual Cl13:Arm Clones (Ranked by Effector Module)", x = "Effector Module") +
+    scale_x_continuous(limits = c(-0.1, 1.7)) 
+
+sig <- plot.df %>% filter(TRB_CDR3 %in% clones.to.plot$TRB_CDR3) %>%
+  ggplot(aes(x = 1, y = fct_reorder(TRB_CDR3, Eff.Module))) + 
+    scale_color_manual(values = d0.clone.pal) +
+    geom_text(data = pval.df, aes(label = Sig.Sum.Eff, color = d0Cluster), angle = 0, show.legend = F) + theme_void()
+
+histo <- all.cells %>%
+  ggplot(aes(x = Teff_Module3, y = "null")) + #
+  geom_density_ridges() +
+  theme_void() + scale_x_continuous(limits = c(-0.1, 1.7)) 
+
+plot_grid(histo, NULL, main, sig, align = "vh", rel_widths = c(4.5,1), rel_heights = c(1,5))
+
+# quantify freeucny of clones above or below median for eff  score
+pval.df <- plot.df %>% group_by(TRB_CDR3, d0Cluster) %>%
+  summarise(Sig.Sum.Eff = first(Sig.Sum.Eff), Eff.Module = median(Eff.Module))
+
+pval.df %>% mutate(Direction = ifelse(Sig.Sum.Eff %in% c("*", "**", "***") & Eff.Module > median.eff, "Above Median", NA),
+                   Direction = ifelse(Sig.Sum.Eff %in% c("*", "**", "***") & Eff.Module < median.eff, "Below Median", Direction), 
+                   Direction = ifelse(Sig.Sum.Eff == " " , "ns", Direction)) %>% 
+  ungroup %>%
+  dplyr::count(d0Cluster, Direction) %>% group_by(d0Cluster) %>% mutate(n = n/sum(n)) %>% 
+    mutate(Direction = factor(Direction, levels = c("Above Median", "ns", "Below Median"))) %>%
+  ggplot(aes(x = d0Cluster, y = n*100 , fill = Direction)) + geom_col() + 
+  plot.theme + 
+  labs(x = element_blank(), y = "% of Clones", title = element_blank()) +
+  scale_y_continuous(expand = expansion(mult = c(0.0, 0.05))) + 
+  scale_fill_manual(values =  c("#007f7a", "grey70", "#940068"), name = "P<0.05 vs All Cl13:Arm") + 
+  theme(legend.position = "right") + rotate_x_text(45)
+
+
+pval.df %>% mutate(Direction = ifelse(Sig.Sum.Eff %in% c("*", "**", "***") & Eff.Module > median.eff, "Above Median", NA),
+                   Direction = ifelse(Sig.Sum.Eff %in% c("*", "**", "***") & Eff.Module < median.eff, "Below Median", Direction), 
+                   Direction = ifelse(Sig.Sum.Eff == " " , "ns", Direction)) %>% 
+  ungroup %>%
+  dplyr::count(d0Cluster, Direction) %>% group_by(d0Cluster) %>% mutate(n = n/sum(n)) 
+
+```
+
+# plot individual genes in Teff score and exhaustion score
+```{r}
+plot.df <- FetchData(so, vars = c("Klrg1", "Ccr2", "Ly6c2", "Pdcd1", "Tox", "Lag3"), slot = "counts", assay = "RNA") %>%
+  cbind(so@meta.data) %>%
+  mutate(TRB_CDR3 = ifelse(is.na(TRB_nt) & chains == "ab", NA, paste(Group, substr(TRB_nt, 4, nchar(TRB_nt) - 3), sep = "_"))) %>% 
+  full_join(merged.df %>% ungroup %>% select(TRB_CDR3, cluster), by = "TRB_CDR3") %>% rename(d0cluster = cluster) %>%
+  mutate(d0cluster = if_else(is.na(d0cluster), "NA", d0cluster)) %>%
+  mutate(d0cluster = if_else(Group == "EndoGP33", "Endo GP33+", d0cluster)) %>% 
+  filter(d0cluster != "NA") %>% 
+  group_by(TRB_CDR3, d0cluster) %>% 
+  summarize(across(c(Klrg1, Ccr2, Ly6c2, Pdcd1, Tox, Lag3), mean, na.rm = TRUE), .groups = "drop")
+
+plot.df %>% 
+  pivot_longer(cols = c("Klrg1", "Ccr2", "Ly6c2", "Pdcd1", "Tox", "Lag3")) %>% 
+  mutate(name = factor(name, levels = c("Klrg1", "Ccr2", "Ly6c2", "Pdcd1", "Tox", "Lag3"))) %>%
+  mutate(d0cluster = factor(d0cluster, levels = names(d0.clone.pal))) %>%
+  ggplot(aes(x = d0cluster, y = value)) +
+  facet_wrap(~name, scales = "free", ncol = 3) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(width = 0.2, height = 0, aes(color = d0cluster), show.legend = T, size = 0.4) +
+  plot.theme + rotate_x_text(45) + 
+  scale_color_manual(values = d0.clone.pal, name = element_blank()) + 
+  labs(x = "Pre-Transfer Clone Behavior", y = "Average Expression Per Clone") + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+
+```
+
+
+
+
+

@@ -1,0 +1,254 @@
+# Assess DEGs between clusters and look at cluster distribtuion per group
+
+## load common libraries + load SO + set paths
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(ggrepel)
+  library(data.table)
+  library(ComplexHeatmap)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(writexl)
+})
+
+path <- "~/ChronicMemoryGithub_Submission/1_scRNATCRseqAtlas"
+so <- readRDS(paste0(path, "/data/1C_IntegratedSeuratObject.rds"))
+outs <- paste0(path,"/output")
+```
+
+## set aesthetics for plots
+```{r}
+# palette
+clusterpal <- c(
+  "Tcm" = "#65c7ca",
+  "Tem_1" = "#f8a523",
+  "Tem_2" = "#f6d13a",
+  "Tex-Term" = "#b31e0e",
+  "Tex-Int" = "#de311e",
+  "Tex-KLR" = "#E27E73",
+  "Tex-ISG" = "#a0a1d1",
+  "Tex-Prog" = "#a94d9a",
+  "Prolif" = "#e6af7c"
+  )
+
+# plot themes
+plot.theme.umap <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5), 
+        #panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.5, color = "grey80"),
+        axis.text = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "plain")) 
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"))
+
+```
+
+## remove genes function
+```{r}
+#remove TCR genes from VF lists
+remove_genes <- function(features, species, tcr=TRUE, ig=TRUE, cell_cycle=TRUE, mito=TRUE, histone=TRUE, ribosome=TRUE) {
+    print(paste("Before filtering:", length(features), "features"))
+
+    if (species == "human") {
+        if (tcr) {
+            features <- features[!grepl("^TR[ABGD][VDJC]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^IG[HLK][VDJC]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% unlist(cc.genes))]
+        }
+        if (mito) {
+            features <- features[!grepl("^MT-", features)]
+        }
+    }
+    if (species == "mouse") {
+        if (tcr) {
+            features <- features[!grepl("^Tr[abgd][vdjc]", features)]
+        }
+        if (tcr) {
+            features <- features[!grepl("^Tcr[abgd][vdjc]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^Ig[hlk][vdjc]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% stringr::str_to_title(unlist(cc.genes)))]
+        }
+        if (mito) {
+            features <- features[!grepl("^Mt-", features)]
+        }
+      
+       if (histone) {
+            features <- features[!grepl("^Hist", features)]
+       }
+      
+       if (ribosome) {
+            features <- features[!grepl("^Rps", features)]
+       }
+      
+      if (ribosome) {
+            features <- features[!grepl("^Rpl", features)]
+        }
+      
+    }
+
+    print(paste("After filtering:", length(features), "features"))
+    
+    return(features)
+}
+```
+
+## find variable features, and remove TCR, cell_cycle etc, genes - save as vf.clean
+```{r}
+# already ran find vf in integration workflow, but repeating to be safe
+
+DefaultAssay(so) <- "integrated"
+so <- FindVariableFeatures(so)
+vf.clean <- remove_genes(VariableFeatures(so), 
+                         species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+
+
+```
+
+## find DEGs
+```{r}
+DefaultAssay(so) <- "RNA"
+all.markers <- FindAllMarkers(so, features = vf.clean, only.pos = T, logfc.threshold = 0.25, assay = "RNA", test.use = "wilcox", verbose = T)
+```
+
+## rename cell clusters - based on DEG 
+```{r}
+DimPlot(so, label = T)
+
+# rename idents based on DEGs
+so@meta.data$cell_cluster <- NA
+
+so$cell_cluster[so$seurat_clusters == "0"] <-  "Tem_2"
+so$cell_cluster[so$seurat_clusters == "1"] <-  "Tcm"
+so$cell_cluster[so$seurat_clusters == "2"] <-  "Tem_1"
+so$cell_cluster[so$seurat_clusters == "3"] <-  "Tex-Term"
+so$cell_cluster[so$seurat_clusters == "4"] <-  "Tex-KLR"
+so$cell_cluster[so$seurat_clusters == "5"] <-  "Tex-Int"
+so$cell_cluster[so$seurat_clusters == "6"] <-  "Tex-Prog"
+so$cell_cluster[so$seurat_clusters == "7"] <-  "Tex-ISG"
+so$cell_cluster[so$seurat_clusters == "8"] <-  "Prolif"
+
+Idents(so) <- factor(so$cell_cluster,
+                           levels = c( "Tcm", "Tem_1", "Tem_2", "Tex-KLR", "Tex-Int", "Tex-Term", "Tex-Prog",  "Tex-ISG", "Prolif"))
+
+
+DimPlot(so, cols = clusterpal) + #+ plot.theme.umap + ggtitle(label = "CD8 T cells") 
+  geom_text(data = data.frame(x = 1, y = 2), x = 2.5, y = -5.3, label = paste("n =", length(so$barcode), "cells"), size = 4) + 
+  plot.theme.umap +
+  ggtitle("GP33+ T Cells")
+
+
+so@meta.data %>% dplyr::count(cell_cluster, Group) %>% group_by(Group)%>% mutate(freq = n/sum(n)) %>% 
+  filter(Group == "Cl13 d100+") %>% filter(grepl("Tex", cell_cluster)) %>% ungroup() %>% mutate(sum = sum(freq))
+```
+
+## plot DEG (all DEG)
+```{r}
+# fetch expression with dotplot
+hm.df <- DotPlot(so, features = unique(all.markers$gene))$data %>% 
+  select(c(avg.exp, features.plot, id)) %>% 
+  pivot_wider(names_from = id, values_from = avg.exp) %>% 
+  as.data.frame() %>%  `rownames<-`(.[,1]) %>% select(-features.plot) %>%
+  t() %>% scale()
+
+## annotations
+mark.df <- data.frame('gene' = colnames(hm.df), 'n' = 1:length(colnames(hm.df))) 
+genes <- c("Tox", "Pdcd1", "Tim3", "Havcr2", "Lag3", "Cd101", "Sell", "Il7r", "Ccr7", "Tcf7", "Myb", "Slamf6", 
+           "Cx3cr1", "Zeb2", "Klrg1", "Xcl1", "Gzmb","Isg15", "Id3", "Mki67", "Cxcr6", "Ifng", "Pclaf", "Cdkn3", "Cd7", "Cd160", "Ifit3", "Ifi1","Ifi27l2a", "Cxcr3", "Lgals3", "S1pr5")
+
+gene.annot <- columnAnnotation(anno = anno_mark(at = mark.df$n[mark.df$gene %in% genes], 
+                                             labels = mark.df$gene[mark.df$gene %in% genes], 
+                                             which = "row", padding = 0.8))
+
+ha.clust <- rowAnnotation(`Cluster` = rownames(hm.df), 
+                        col = list(`Cluster` = clusterpal),
+                        show_legend = F)
+
+# plot HM
+hm.alldeg <- hm.df %>% 
+  Heatmap(name = "Z-score", 
+          left_annotation = ha.clust, top_annotation = gene.annot,
+          col = viridis(n = 9, option = "magma") ,
+          # col = zrev(brewer.pal(9, "RdBu")), 
+          width = unit(5, "in"), height = unit(2.2, "in"), 
+          show_column_dend = F, show_column_names = F, row_dend_width = unit(0.2, "cm"),
+          cluster_rows = T, cluster_columns = T, 
+          border = T, column_names_rot = 45
+        )
+
+hm.alldeg
+
+```
+
+## visualization of cluster distribution per group / sample
+```{r}
+# dim reduction plots per group 
+umap.df <- data.frame(so@meta.data,  so@reductions$umap@cell.embeddings)
+
+var.list <- c("Cl13 d21-26", "Cl13 d100+", "Arm" )  # vector of groups
+
+plots <- lapply(var.list, function(x) {
+  subset <- umap.df %>% subset(Group == x)
+  umap <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(color = "grey80", size = 0.3) +
+    geom_point(data = subset, size = 0.3, aes(color = cell_cluster)) + 
+    ggtitle(x) + 
+    scale_color_manual(values = clusterpal)  + plot.theme.umap + NoLegend()
+
+   umap %>% return()
+   
+})
+
+do.call(plot_grid, c(plots, ncol = 3))
+
+# Bar plots per each animal
+so@meta.data %>% count(Group, REP, Sort, cell_cluster) %>% 
+  group_by(Group, REP, Sort) %>% mutate(n = n/sum(n)) %>% 
+  ggplot(aes(x = paste0(Group, Sort, REP), fill = cell_cluster, y = n)) + 
+           geom_col() + 
+  plot.theme + 
+  scale_y_continuous(expand = expansion(mult = c(0.0, 0.02))) + 
+  scale_fill_manual(values = clusterpal, name = "Cluster")  + 
+  labs(x = "Sample", y = "Fraction of Cells") + rotate_x_text(90)
+
+
+# plot out each sort on UMAP
+var.list <- c("Arm", "Cl13 d21-26", "Cl13 d100+") # vector of groups
+
+plots <- lapply(var.list, function(x) {
+  subset <- umap.df %>% subset(Group == x) %>% rownames_to_column("Bar") %>% arrange(Bar)
+ 
+  umap <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(color = "grey90", size = 0.3) +
+    geom_point(data = subset, size = 0.3, aes(color = Sort)) + 
+    ggtitle(x) +
+    plot.theme.umap 
+  return(umap)
+     
+})
+
+do.call(ggarrange, c(plots, ncol = 3, common.legend = T))
+
+```
+# export RDS
+```{r}
+saveRDS(so, file = paste0(path, "/data/1D_IntegratedSeuratObject_IDdClusters.rds"))
+
+```
+
+

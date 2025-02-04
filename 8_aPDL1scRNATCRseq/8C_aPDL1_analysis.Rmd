@@ -1,0 +1,401 @@
+# here, we are perfoming analysis to make all plots associated with this dataset. we will look at deg between clusters, compare gene expression state of cells from both groups, and do analysis of clonal behaviors
+
+# load in seurat object and commonly used packages
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(Seurat)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(data.table)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  library(ggrepel)
+  library(writexl)
+  library(Hmisc)
+})
+
+path <- "~/ChronicMemoryGithub_Submission/8_aPDL1scRNATCR"
+so <-  paste0(path, "/data/8B_aPDL1_integratedseuratobj.rds") %>% readRDS() 
+```
+
+# set plot aesthetics
+```{r}
+# palette
+clusterpal <- c(
+  "Tcm" = "#65c7ca",
+  "Tem_1" = "#f8a523",
+  "Tem_2" = "#f6d13a",
+  "Tex-Term_1" = "#bf3619",
+  "Tex-Term_2" = "#7d1d19",
+  "Tex-Int" = "#de311e",
+  "Tex-KLR" = "#E27E73",
+  "Tex-ISG" = "#a0a1d1",
+  "Tex-Prog" = "#a94d9a",
+  "Prolif" = "#e6af7c"
+  )
+
+clone.pal <- c("Divergent" = "#e6af7c", 
+               "Tcm Bias" = "#65c7ca",
+               "Tex-Term Bias" = "#bf3619",
+               "Tex-Prog Bias" = "#a94d9a", 
+               "Tem_1 Bias" = "#f8a523", 
+               "Tem_2 Bias" = "#f6d13a"
+                 )
+
+group.pal <- c("PBS" = "#886231", "aPDL1" = "#299093")
+
+plot.theme.umap <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5), 
+        #panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.5, color = "grey80"),
+        axis.text = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "plain")) 
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"))
+```
+
+# remove genes function
+```{r}
+#remove TCR genes from VF lists
+remove_genes <- function(features, species, tcr=TRUE, ig=TRUE, cell_cycle=TRUE, mito=TRUE, histone=TRUE, ribosome=TRUE) {
+    print(paste("Before filtering:", length(features), "features"))
+
+    if (species == "human") {
+        if (tcr) {
+            features <- features[!grepl("^TR[ABGD][VDJC]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^IG[HLK][VDJC]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% unlist(cc.genes))]
+        }
+        if (mito) {
+            features <- features[!grepl("^MT-", features)]
+        }
+    }
+    if (species == "mouse") {
+        if (tcr) {
+            features <- features[!grepl("^Tr[abgd][vdjc]", features)]
+        }
+        if (tcr) {
+            features <- features[!grepl("^Tcr[abgd][vdjc]", features)]
+        }
+        if (ig) {
+            features <- features[!grepl("^Ig[hlk][vdjc]", features)]
+        }
+        if (cell_cycle) {
+            features <- features[!(features %in% stringr::str_to_title(unlist(cc.genes)))]
+        }
+        if (mito) {
+            features <- features[!grepl("^Mt-", features)]
+        }
+      
+       if (histone) {
+            features <- features[!grepl("^Hist", features)]
+       }
+      
+       if (ribosome) {
+            features <- features[!grepl("^Rps", features)]
+       }
+      
+      if (ribosome) {
+            features <- features[!grepl("^Rpl", features)]
+        }
+      
+    }
+
+    print(paste("After filtering:", length(features), "features"))
+    
+    return(features)
+}
+```
+
+# find variable features, and remove TCR, mito, cell_clycle, histone, ribosome genes
+```{r}
+
+# variable features were run already, just doing it again to be safe 
+DefaultAssay(so) <- "integrated"
+so <- FindVariableFeatures(so)
+vf.clean <- remove_genes(VariableFeatures(so), 
+                         species = "mouse" , tcr=T, ig=F, cell_cycle=T, mito=T, histone=T, ribosome=T)
+```
+
+# find DEG of clusters
+```{r}
+DefaultAssay(so) <- "RNA"
+all.markers <- FindAllMarkers(so, features = vf.clean, only.pos = T, logfc.threshold = 0.25, assay = "RNA", test.use = "wilcox", verbose = T)
+
+# write.csv(all.markers, file = paste0(outs, "/3F - DEG per cluster.csv"))
+# write_xlsx(all.markers, paste0(outs, "/3F - DEG per cluster.xlsx"))
+```
+
+# plot DEG
+```{r}
+# all deg per cluster ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+hm.df <- DotPlot(so, features = unique(all.markers$gene))$data %>% 
+  select(c(avg.exp, features.plot, id)) %>% 
+  pivot_wider(names_from = id, values_from = avg.exp) %>% 
+  as.data.frame() %>%  `rownames<-`(.[,1]) %>% select(-features.plot) %>%
+  t() %>% scale()
+
+## annotations
+
+mark.df <- data.frame('gene' = colnames(hm.df), 'n' = 1:length(colnames(hm.df))) 
+genes <- c("Tox", "Pdcd1", "Tim3", "Havcr2", "Lag3", "Cd101", "Sell", "Il7r", "Ccr7", "Tcf7", "Myb", "Slamf6", 
+           "Cx3cr1", "Zeb2", "Klrg1", "Xcl1", "Gzmb","Isg15", "Id3", "Mki67", "Cxcr6", "Ifng", "Pclaf", "Cdkn3", "Cd7", "Cd160", "Ifit3", "Ifi1","Ifi27l2a", "Cxcr3", "Lgals3", "S1pr5")
+
+gene.annot <- columnAnnotation(anno = anno_mark(at = mark.df$n[mark.df$gene %in% genes], 
+                                             labels = mark.df$gene[mark.df$gene %in% genes], 
+                                             which = "row", padding = 0.8))
+
+ha.clust <- rowAnnotation(`Cluster` = rownames(hm.df), 
+                        col = list(`Cluster` = clusterpal),
+                        show_legend = F)
+
+# plot HM
+hm.alldeg <- hm.df %>% 
+  Heatmap(name = "Z-score", 
+          left_annotation = ha.clust, top_annotation = gene.annot,
+          col = viridis(n = 9, option = "magma") ,
+          # col = zrev(brewer.pal(9, "RdBu")), 
+          width = unit(5, "in"), height = unit(2.2, "in"), 
+          show_column_dend = F, show_column_names = F, row_dend_width = unit(0.2, "cm"),
+          cluster_rows = T, cluster_columns = T, 
+          border = T, column_names_rot = 45
+        )
+
+hm.alldeg
+
+```
+
+# Determine cluster proportion per group
+```{r}
+DimPlot(so, cols = clusterpal) +  plot.theme.umap 
+
+# per group plots - UMAP ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+umap.df <- data.frame(so@meta.data,  so@reductions$umap@cell.embeddings)
+
+# vector of groups
+var.list <- c("PBS", "aPDL1") 
+
+plots <- lapply(var.list, function(x) {
+subset <- umap.df %>% subset(Group2 == x)
+  umap <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(color = "grey90", size = 0.3) +
+    geom_point(data = subset, size = 0.3, aes(color = cell_cluster)) + 
+    ggtitle(x) + 
+    scale_color_manual(values = clusterpal)  + plot.theme.umap + NoLegend()
+  
+  bar <- subset %>% dplyr::count(cell_cluster, Group2) %>% mutate(n = n/sum(n)) %>%
+    ggplot(aes(y = n, fill = cell_cluster, x = Group2)) + geom_col(show.legend = F) + 
+    plot.theme + 
+    labs(x = element_blank(), y = "Fraction of Cells") + 
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.02)), breaks=c(0, 0.5, 1)) + 
+    scale_fill_manual(values = clusterpal) + coord_flip()
+  
+   plot_grid(umap, bar, rel_heights = c(1, 0.3), ncol = 1) %>% return()
+   
+})
+
+do.call(plot_grid, c(plots, ncol = 2))
+
+
+# per per mouse cluster dist ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+data.frame(so@meta.data,  so@reductions$umap@cell.embeddings) %>% 
+  count(Group2, Rep, cell_cluster) %>% 
+  filter(Group2 %in% c("PBS", "aPDL1")) %>% 
+  mutate(Group2 = factor(Group2, levels = c("PBS", "aPDL1"))) %>%
+  group_by(Group2, Rep) %>% 
+  mutate(n = n/sum(n)) %>% 
+  ggplot(aes(x = Group2, y = n)) +
+    facet_wrap(~cell_cluster, scales = "free", ncol = 10) + 
+    geom_boxplot(color = "black", outlier.shape = NA) + 
+    geom_jitter(size = 2, width = 0.2, height = 0, aes(color = Group2)) + 
+    plot.theme + 
+    scale_color_manual(values = group.pal) + 
+    theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), strip.background = element_rect(fill = "transparent"), legend.position = "none") + 
+    stat_compare_means(comparisons = list(c("aPDL1", "PBS")), tip.length = 0) +
+    scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) + 
+    labs(x = "Group", y = "Fraction of Cells")
+
+
+```
+
+# determine behaviors of clones in each group
+```{r}
+so@meta.data$clone_id <- paste(so$Group2, so$Rep, so$cdr3s_nt, sep = "__")
+
+exp.clones <- so@meta.data %>% filter(Group2 %in% c("PBS", "aPDL1"), chains =="ab") %>% 
+  dplyr::count(clone_id, name = "CloneSize") %>% 
+  mutate(CloneFreq = CloneSize / sum(CloneSize)) %>% ungroup %>% 
+  select(clone_id, CloneFreq, CloneSize) %>% filter(CloneSize > 2)
+
+# phenotype proportion per clone
+clone.df <- so@meta.data %>% filter(clone_id %in% exp.clones$clone_id) %>% 
+  dplyr::count(cell_cluster, clone_id) %>%
+  group_by(clone_id) %>% mutate(n = n/sum(n)) %>%
+  pivot_wider(names_from = cell_cluster, values_from = n) %>%
+  ungroup() %>% as.data.frame() %>%
+  mutate(across(everything(), ~replace_na(.x, 0))) %>% 
+  left_join(exp.clones) 
+clone.df
+
+clone.df$CloneSize %>% median
+
+clone.df %>% select(-c(clone_id, CloneSize, CloneFreq, CloneSize)) %>% Heatmap(show_column_names = T, border = T, col= brewer.pal(9, "Purples"))
+
+# cluster clones based on clone proportions
+set.seed(22)
+clusters <- kmeans(clone.df %>% select(-c(clone_id, CloneSize, CloneFreq)), centers = 8)
+clone.df$Clone_Behavior <- clusters$cluster
+
+# rename clusters
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "1"] <- "Tem_2 Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "2"] <- "Divergent"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "3"] <- "Tex-Term Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "4"] <- "Tem_1 Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "5"] <- "Tem_1 Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "6"] <- "Tem_1 Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "7"] <- "Tcm Bias"
+clone.df$Clone_Behavior[clone.df$Clone_Behavior == "8"] <- "Tex-Prog Bias"
+
+# heatmaps
+col.annot <- columnAnnotation(` `  = select(clone.df, -c(clone_id, Clone_Behavior, CloneFreq,  CloneSize)) %>% colnames(), 
+              col = list(` ` = clusterpal), show_legend = F)
+
+
+groups <- clone.df %>% separate(clone_id, into = c("group", "rep" ,"cdr3")) %>% select(group) %>% c()
+
+size.annot <- rowAnnotation(Group = groups$group,
+                            col = list(Group = group.pal), show_legend = T)
+
+clone.hm <- clone.df %>% select(-c(clone_id, Clone_Behavior, CloneSize, CloneFreq)) %>% 
+  Heatmap(name = "Fraction of Clone",
+          show_column_names = T, border = T, col= brewer.pal(9, "Purples"), 
+          row_split = clone.df$Clone_Behavior,
+          show_row_dend = F, show_column_dend = T,
+          row_title_rot = 0, 
+          width = unit(10*0.6, "cm"), height = unit(8, "cm"), column_dend_height = unit(0.2, "cm"),
+          top_annotation = col.annot, right_annotation = size.annot,
+          column_title = paste0("n=", clone.df$clone_id %>% length(), " Clones >2 Cells") 
+          )
+
+# pdf(file = paste0(outs, "/3F_CloneHM_Cl13mem.pdf"))
+clone.hm
+# dev.off()
+
+
+clone.df %>% separate(clone_id, into = c("group", "rep" , "cdr3")) %>% count(group, rep, Clone_Behavior) %>% 
+  group_by(group, rep) %>% mutate(n = n/sum(n)) %>% 
+  ggplot(aes(x = group, y = n)) + geom_boxplot() + geom_jitter(aes(color = group)) + facet_wrap(~Clone_Behavior) + stat_compare_means()
+```
+
+
+# PCA similarities between clusters between gorups
+### to look at differences between clusters, we extract PC embeddings, then look at correlations of the top 30 PCs between groups
+```{r}
+# extract embedings and metadata
+pca.df <- data.frame(so@meta.data %>% select(cell_cluster, Group2), Embeddings(so, reduction = "pca"))  %>% 
+  filter(Group2 %in% c("PBS", "aPDL1")) %>%
+  mutate(Pheno_Group = paste(Group2, cell_cluster, sep = "__"))
+
+pca.df %>% head
+
+# group by PhenoGroup and summarized PCs
+summarized.pcs <- pca.df %>% group_by(Pheno_Group) %>% 
+  dplyr::summarise(across(where(is.numeric), median, na.rm = TRUE))
+
+# find correlations
+cors <- summarized.pcs %>% column_to_rownames("Pheno_Group") %>% t() %>% Hmisc::rcorr() 
+
+# select only correlations of interest, summarize adjusted p values
+r.values <- cors$r[1:10,11:20] 
+p.values <- cors$P[1:10,11:20]
+
+sig_matrix <- matrix(" " , nrow = nrow(r.values), ncol = ncol(r.values))
+colnames(sig_matrix) <- colnames(r.values)
+rownames(sig_matrix) <- rownames(r.values)
+
+# sumamrize bonferoni corrected pvalues
+sig_matrix[p.values <=  0.05 / p.values %>% length()] <- "*" 
+sig_matrix[p.values <=  0.01 / p.values %>% length()] <- "**" 
+sig_matrix[p.values <=  0.001 / p.values %>% length()] <- "***"
+
+# rename row and column names
+rownames(r.values) <- gsub(".*__", "", rownames(r.values))
+colnames(r.values) <- gsub(".*__", "", colnames(r.values))
+
+# plot
+col.annot <- columnAnnotation(` `  = colnames(r.values), col = list(` ` = clusterpal), show_legend = F)
+row.annot <- rowAnnotation(` `  = colnames(r.values), col = list(` ` = clusterpal), show_legend = F)
+
+hm.cor <- r.values %>% Heatmap(
+                      col = viridis(9) , border = T, 
+                      width = unit(7, "cm"), height = unit(7, "cm"), name = "Pearson R", 
+                      cluster_rows = T, cluster_columns = T, row_dend_width = unit(0.2, "cm"), column_dend_height = unit(0.2, "cm"), row_dend_side = "right" ,
+                      row_title = "aPDL1 Cluster" , column_title = "PBS Cluster" , 
+                      row_title_side = "left", column_title_side = "bottom", row_names_side = "left",
+                      left_annotation = row.annot, bottom_annotation = col.annot,
+                      cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sig_matrix[i, j], x, y, gp = gpar(fontsize = 8, col = "black"))},
+                  )
+
+hm.cor
+```
+
+# follow-up: DEG between cells in a given cluster between PBS and aPDL1 group
+```{r}
+test.list <- unique(so$cell_cluster)
+
+# caclualte within cluster DEG
+intra.cellular.deg <- lapply(test.list, function(x){
+
+    ## subset only cells in cluster
+    so.subset <- subset(so, cell_cluster == x)
+    
+    ## vector of up cells and down cells
+    cells.up <- subset(so.subset, Group2 == "aPDL1") %>% colnames()
+    cells.down <- subset(so.subset, Group2 == "PBS") %>% colnames()
+    
+    deg <- FindMarkers(object = so.subset, 
+                       ident.1 = cells.up, ident.2 = cells.down, 
+                       logfc.threshold = 0, assay = "RNA", features = vf.clean)
+    
+    deg <- deg %>% mutate(gene = rownames(deg)) %>%
+      mutate(sig = dplyr::if_else(p_val_adj < 0.01 & avg_log2FC > 0.25, "aPDL1", "ns")) %>% 
+      mutate(sig = dplyr::if_else(p_val_adj < 0.01 & avg_log2FC < -0.25,  "PBS", sig)) %>%
+      filter(sig != "ns") %>% 
+      mutate(cluster = x)
+    
+    return(deg)
+
+})
+
+# print number of DEG
+do.call(rbind, intra.cellular.deg) %>% count(cluster, name = "aPDL1 vs PBS")
+
+# calcualte DEG that define a cluster as a control
+all.markers.updown <- FindAllMarkers(so, assay = "RNA", logfc.threshold = 0.25, only.pos = F, features = vf.clean)
+
+# bind together and plot
+merge(x = all.markers.updown %>% mutate(sig = dplyr::if_else(p_val_adj < 0.01, "sig", "ns")) %>% filter(sig != "ns") %>% count(cluster, name = "Cluster DEG") , 
+     y = do.call(rbind, intra.cellular.deg) %>% count(cluster, name = "aPDL1 vs PBS") 
+    ) %>% 
+  pivot_longer(cols = -cluster) %>% 
+  ggplot(aes(y = cluster, x = value, fill = name)) + geom_col(position = "dodge") +
+  labs(x = '# of DEG', y = "Cluster") +
+  plot.theme +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2))) + 
+  scale_fill_manual(values = c("grey", "black"), name = element_blank()) 
+
+
+```
+

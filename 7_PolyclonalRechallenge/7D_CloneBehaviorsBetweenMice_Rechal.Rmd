@@ -1,0 +1,357 @@
+# in this notebook, we're testing the efficacy of our model of polyclonal rechallenge in mutliple hosts.
+### if the model works well, we should see individual clones in different hosts expand to a similar degree and also take on similar gene expression states in different hosts
+
+# load common libraries + read in SO + set paths
+```{r}
+library(tidyverse) 
+library(Seurat)
+library(RColorBrewer)
+library(viridis)
+library(cowplot)
+library(ggridges)
+library(data.table)
+library(ggpubr)
+library(ComplexHeatmap)
+library(MetBrewer)
+
+path <- "~/ChronicMemoryGithub_Submission/7_PolyclonalRechallenge/data/"
+outs <- paste0(path, "/3_CloneAnalysis/outs")
+
+so <- paste0(path, "/7C_SeuratObject_ClusteredAndIDd.rds") %>% readRDS()
+
+```
+
+# plot aesthetics
+```{r}
+plot.theme.umap <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5), 
+        # panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.5, color = "grey80"),
+        axis.text = element_blank(),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "plain")) 
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"), 
+                                      strip.background = element_rect(fill = "transparent"), strip.text = element_text(size = 14),)
+
+clusterpal <- c(   
+  "SLEC_1" = "#014f63",
+  "SLEC_2" = "#62939a",
+  "Eff_Mem" = "#65c7ca",
+  "MPEC" = "#122452",
+  "Exh_Eff" = "#ef8577",
+  "Exh_EM" = "#e62230",
+  "Exh_Term" = "#a11822",
+  "Prolif_1" = "#f6d13a",    
+  "Prolif_2" = "#f26e36",   
+  "ISG" = "#e6af7c"
+  )
+
+DimPlot(so, cols = clusterpal)
+```
+# correlation of clone size of sisters across hosts 
+```{r}
+# create dataframe with all cells in it - split clone into TCRb and TCRa 
+## we use TCRb only because the bulk TCR-seq from pre-rechallenge uses only TCRb
+all.cells <- so@meta.data %>% 
+    separate(cdr3s_nt, sep = ";", into = c("TRB", "TRA"), remove = F) %>% 
+    mutate(TRB_CDR3 = paste(Group, TRB, sep = "_"))
+
+# determine each clone as count and % of total cells per donor mouse
+all.cells <- all.cells %>% count(Rep, TRB_CDR3, name = "CloneCount") %>%
+  group_by(Rep) %>% mutate(CloneFreq = CloneCount/sum (CloneCount)) %>% 
+  full_join(all.cells, by = c("Rep", "TRB_CDR3")) 
+
+# filter only the clones that are suitable for analysis - only clones with a single TCRa and single TCRb and exlude any NAs
+filtered.cells <- all.cells %>% ungroup %>% filter(chains == "ab", !is.na(cdr3s_nt), Group %in% c("AcuMem", "ChrMem"))
+
+# pivot dataframe into wide format to calculate correlations
+cor.df <- filtered.cells %>% select(Group, TRB_CDR3, CloneFreq, Rep) %>%
+  group_by(TRB_CDR3, Rep) %>% summarise(across(everything(), first)) %>%
+  mutate(Rep = paste0("R_", Rep)) %>%
+  pivot_wider(values_from = CloneFreq, names_from = Rep) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .)))
+
+# calculate cor of clones =====================================================
+clones <- split(cor.df, cor.df$Group) %>% 
+  lapply(function(df){
+    cors <- df %>% ungroup %>% 
+      select("R_1", "R_2", "R_3", "R_4", "R_5") %>% cor(method = "pearson") %>% c() %>% 
+      unique() #use uniqe to remove the same comparisons done twice - ie R1 vs R2 and R2 vs R1
+    cors[cors <1] %>% return() # Filter by < 1 to get rid of same mouse compared to itself and only real comparisions
+  })
+
+# calculate cor of shuffled clones =====================================
+shuffled.clones <- split(cor.df, cor.df$Group) %>% 
+  lapply(function(df){
+    cors <- df %>% ungroup %>% 
+      mutate(R_1 = sample(R_1), R_2 = sample(R_2), R_3 = sample(R_3), R_4 = sample(R_4), R_5 = sample(R_5),) %>%
+      select("R_1", "R_2", "R_3", "R_4", "R_5") %>% cor(method = "pearson") %>% c() %>% 
+      unique() #use uniqe to remove the same comparisons done twice - ie R1 vs R2 and R2 vs R1
+    cors[cors <1] %>% return() # Filter by < 1 to get rid of same mouse compared to itself and only real comparisions
+  })
+
+# bind together into a dataframe
+plot.df <- data.frame(Clones = unlist(clones), Shuffled = unlist(shuffled.clones)) 
+plot.df <- plot.df %>% mutate(Group = ifelse(grepl("Acu", rownames(plot.df)), "Arm:Arm", "Cl13:Arm")) %>% 
+  pivot_longer(cols = c(Clones, Shuffled))
+
+# plot differences
+size.plot <- plot.df %>% ggplot(aes(x = fct_reorder(name, value),y = value)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.2, aes(color = name), show.legend = F) + 
+  stat_compare_means(comparisons = list(c("Clones", "Shuffled")), tip.length = 0) + 
+  labs(x = element_blank(), y = "Pearson Cor of Clone Sizes") + 
+  plot.theme + rotate_x_text(45) + 
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) + 
+  facet_wrap(~Group, scales = "free")
+
+size.plot
+
+```
+
+# heatmap of correlations
+```{r}
+library(circlize)
+col_fun = colorRamp2(seq(from=0, to=0.6, by=0.1), c(viridis(7)))
+
+
+cor.mat.arm <- cor.df %>% ungroup %>% filter(Group == "AcuMem") %>% select("R_1", "R_2", "R_3", "R_4", "R_5") %>% cor(method = "pearson")  
+cor.mat.arm[cor.mat.arm == 1] <- NA
+h1 <- cor.mat.arm %>% Heatmap(col = col_fun, cluster_rows = F, cluster_columns = F, name = "Pearson", border = T, column_title = "Clones: Arm:Arm",
+          height = unit(5, "cm"), width = unit(5, "cm"), na_col = "white", 
+          cell_fun = function(j, i, x, y, width, height, fill) {
+                        grid.text(sprintf("%.2f", cor.mat.arm[i, j]), x, y, gp = gpar(fontsize = 8, col = "black"))},)
+
+cor.mat.c13 <- cor.df %>% ungroup %>% filter(Group == "ChrMem") %>% select("R_1", "R_2", "R_3", "R_4", "R_5") %>% cor(method = "pearson")
+cor.mat.c13[cor.mat.c13 == 1] <- NA
+h2 <- cor.mat.c13 %>% Heatmap(col = col_fun, cluster_rows = F, cluster_columns = F, name = "Pearson", border = T, column_title = "Clones: Cl13:Arm",
+          height = unit(5, "cm"), width = unit(5, "cm"), na_col = "white", 
+          cell_fun = function(j, i, x, y, width, height, fill) {
+                        grid.text(sprintf("%.2f", cor.mat.c13[i, j]), x, y, gp = gpar(fontsize = 8, col = "black"))},)
+
+
+h1 + h2  
+
+
+```
+
+# PC correlation of sister pairs of Cells
+### calculate the PC correlation of each pair of cells and then plot correlations between real clones and fake clones
+### method adapted from Singh et al 2024 (BioRxiv) https://www.biorxiv.org/content/10.1101/2024.05.14.594084v1.full
+```{r}
+
+
+# pull out PCs embeddings and metadata
+all.cells.pcs <- data.frame(so@meta.data %>% select(Group, Rep, barcode, cdr3s_nt, TRB_nt, chains), Embeddings(so, reduction = "pca")) %>% 
+    separate(cdr3s_nt, sep = ";", into = c("TRB", "TRA"), remove = F) %>% 
+    mutate(TRB_CDR3 = ifelse(is.na(TRB_nt) & chains == "ab", NA, paste(Group, substr(TRB_nt, 4, nchar(TRB_nt) - 3), sep = "_"))) %>%
+    filter(chains == "ab", !is.na(cdr3s_nt))
+
+# determine each clones size as a number of total cells read in 10X and isolate only clones that are >=10 cells
+all.cells.pcs <- all.cells.pcs %>% count(Group, TRB_CDR3, name = "CloneCount") %>% full_join(all.cells.pcs, by = c("Group", "TRB_CDR3")) 
+
+selectedclones.pcs <- filter(all.cells.pcs, CloneCount >= 10) 
+
+# create cell x cell correlation matrix
+cor.mat <- selectedclones.pcs %>% select(paste0("PC_", 1:30)) %>% t %>% cor(method = "pearson") 
+
+# add a number to each cell to find it in the matrix
+selectedclones.pcs$cell_number <- c(1:length(selectedclones.pcs$barcode))
+
+# Real sister correlations ======================================================
+# Make new DF for efficiency
+meta.df <- select(selectedclones.pcs, Rep, TRB_CDR3, cell_number)
+
+# Cors within same host 
+
+# for each clone return cell_number of each sister
+sister.list.same <- lapply(c(1:length(selectedclones.pcs$barcode)), function(x) {
+# sister.list.same <- lapply(c(1:10), function(x) {
+  cell.of.interest <- filter(meta.df, cell_number == x)
+  sisters <- meta.df$cell_number[meta.df$TRB_CDR3 == cell.of.interest$TRB_CDR3 & meta.df$cell_number != cell.of.interest$cell_number& meta.df$Rep == cell.of.interest$Rep]
+  # others <- meta.df$cell_number[!meta.df$cell_number %in% c(sisters, x)]
+  sisters
+})
+
+# pull out pearson cor. for that set in the matrix
+sister.cors.same <- lapply(seq_along(sister.list.same), function(i) {
+  row_indices <- sister.list.same[[i]]
+  column_index <- i
+  cor.mat[row_indices, column_index]
+})
+
+sisters.same <- do.call(c, sister.cors.same)
+
+# Cors in different host
+
+# for each clone return cell_number of each sister
+sister.list.other <- lapply(c(1:length(selectedclones.pcs$barcode)), function(x) {
+# sister.list.other <- lapply(c(1:10), function(x) {
+  cell.of.interest <- filter(meta.df, cell_number == x)
+  sisters <- meta.df$cell_number[meta.df$TRB_CDR3 == cell.of.interest$TRB_CDR3 & meta.df$cell_number != cell.of.interest$cell_number& meta.df$Rep != cell.of.interest$Rep]
+  # others <- meta.df$cell_number[!meta.df$cell_number %in% c(sisters, x)]
+  sisters
+})
+
+# pull out pearson cor. for that set in the matrix
+sister.cors.other <- lapply(seq_along(sister.list.other), function(i) {
+  row_indices <- sister.list.other[[i]]
+  column_index <- i
+  cor.mat[row_indices, column_index]
+})
+
+sisters.other <- do.call(c, sister.cors.other)
+
+
+# Shuffled sister correlations ======================================================
+# make new DF and shuffle
+# be sure to keep cells within the same group together
+
+meta.df.shuffled <- select(selectedclones.pcs, Rep, TRB_CDR3, cell_number, Group) %>% 
+  group_by(Group) %>% # grouping will shuffle only within a group
+  mutate(TRB_CDR3 = sample(TRB_CDR3)) %>% ungroup()
+
+# for each clone return cell_number of each sister
+sister.list.shuffled <- lapply(c(1:length(selectedclones.pcs$barcode)), function(x) {
+  cell.of.interest <- filter(meta.df.shuffled, cell_number == x)
+  sisters <- meta.df.shuffled$cell_number[meta.df.shuffled$TRB_CDR3 == cell.of.interest$TRB_CDR3 & meta.df.shuffled$cell_number != cell.of.interest$cell_number]
+  # others <- meta.df.shuffled$cell_number[!meta.df.shuffled$cell_number %in% c(sisters, x)]
+})
+
+# pull out pearson cor. for that set in the matrix
+
+sister.cors.shuffled <- lapply(seq_along(sister.list.shuffled), function(i) {
+  row_indices <- sister.list.shuffled[[i]]
+  column_index <- i
+  cor.mat[row_indices, column_index]
+})
+
+shuffled <- do.call(c, sister.cors.shuffled)
+
+class(shuffled)
+class(sisters.other)
+
+# plot =============================================================================
+
+plot.pcs <- rbind(data.frame(name = "Same_Host", value = sisters.same), 
+                        data.frame(name = "Other_Hosts", value = sisters.other)%>% 
+                  rbind(data.frame(name = "Shuffled", value = shuffled))) 
+
+plot.pcs %>%
+          ggplot(aes(x = fct_reorder(name, value), y = value)) + 
+          geom_violin(aes(fill = name), show.legend = F, scale = "width") +
+          geom_boxplot(width = 0.4, outlier.size = 0.1, notch = F) + 
+          stat_compare_means(comparisons = list(c("Shuffled", "Same_Host"), c("Shuffled", "Other_Hosts")), tip.length = 0) +
+          labs(x = element_blank(), y = "Pearson Cor of PCs 1:30") + 
+          scale_fill_manual(values = c("Shuffled" = "grey50", "Other_Hosts" = "#ea7428" , "Same_Host" = "#663171")) +
+          plot.theme + rotate_x_text(45) + scale_y_continuous(expand = expansion(mult = c(0.1, 0.1))) + ggtitle(" ")
+
+
+```
+
+# UMAPS
+```{r}
+umap.df <- data.frame(so@meta.data, Embeddings(so, reduction = "umap")) %>% 
+    separate(cdr3s_nt, sep = ";", into = c("TRB", "TRA"), remove = F) %>% 
+    filter(!is.na(TRB_nt)) %>%
+    mutate(TRB_CDR3 = ifelse(is.na(TRB_nt) & chains == "ab", NA, paste(Group, substr(TRB_nt, 4, nchar(TRB_nt) - 3), sep = "_")))
+
+# get the biggest clone from each Group
+umap.df %>% count(TRB_CDR3, Group) %>% group_by(Group) %>% slice_max(order_by = n, n = 5)
+
+
+# plot reprenstative Clones
+var.list <- c("1" , "2", "3", "4", "5")
+
+# largest Acute Clone
+plots <- lapply(var.list, function(x) {
+  subset <- umap.df %>% filter(Rep == x, TRB_CDR3 == "AcuMem_GCCAGCAGTTTCAGGGGTGAACAGTAC")
+  umap <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(color = "grey90", size = 1) +
+    geom_point(data = subset, size = 1, aes(color = cell_cluster)) + 
+    ggtitle(paste("Host ", x)) + 
+    scale_color_manual(values = clusterpal)  + plot.theme.umap + NoLegend()
+  
+  bar <- subset %>% dplyr::count(cell_cluster, Rep) %>% mutate(n = n/sum(n)) %>%
+    ggplot(aes(y = n, fill = cell_cluster, x = Rep)) + geom_col(show.legend = F) +
+    plot.theme +
+    labs(x = element_blank(), y = element_blank()) +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.02)), breaks=c(0, 0.5, 1)) +
+    scale_fill_manual(values = clusterpal) + coord_flip()
+
+  plot_grid(umap, bar, rel_heights = c(1, 0.3), ncol = 1) %>% return()
+  
+})
+
+do.call(plot_grid, c(plots, ncol = 5))
+
+# one of the largest chron clones
+plots <- lapply(var.list, function(x) {
+  subset <- umap.df %>% filter(Rep == x, TRB_CDR3 == "ChrMem_GCAAGCAGCTTAATCTGGGGGGCCCCAAACACCGGGCAGCTCTAC")
+  umap <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(color = "grey90", size = 1) +
+    geom_point(data = subset, size = 1, aes(color = cell_cluster)) + 
+    ggtitle(paste("Host ", x)) + 
+    scale_color_manual(values = clusterpal)  + plot.theme.umap + NoLegend()
+  
+  bar <- subset %>% dplyr::count(cell_cluster, Rep) %>% mutate(n = n/sum(n)) %>%
+    ggplot(aes(y = n, fill = cell_cluster, x = Rep)) + geom_col(show.legend = F) +
+    plot.theme +
+    labs(x = element_blank(), y = element_blank()) +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.02)), breaks=c(0, 0.5, 1)) +
+    scale_fill_manual(values = clusterpal) + coord_flip()
+
+  plot_grid(umap, bar, rel_heights = c(1, 0.3), ncol = 1) %>% return()
+  
+})
+
+do.call(plot_grid, c(plots, ncol = 5))
+
+```
+# plot dotplot of important genes between 
+```{r}
+
+# get the biggest clones from each Group
+clones.toplot <- umap.df %>% count(TRB_CDR3, Group, Rep) %>%
+  mutate(Rep=paste0("R", Rep)) %>%
+  pivot_wider(names_from = Rep, values_from = n, values_fill = 0) %>% 
+  filter(REndoGP33==0, R1>10, R2>10, R3>10,R4>10,R5>10) %>% 
+  mutate(totalcells = R1+R2+R3+R4+R5) %>%
+  group_by(Group) %>% slice_max(order_by = totalcells, n = 3, with_ties = F)
+
+clones.toplot
+
+barcodes <- so@meta.data %>% 
+    separate(cdr3s_nt, sep = ";", into = c("TRB", "TRA"), remove = F) %>% 
+    filter(!is.na(TRB_nt)) %>%
+    mutate(TRB_CDR3 = ifelse(is.na(TRB_nt) & chains == "ab", NA, paste(Group, substr(TRB_nt, 4, nchar(TRB_nt) - 3), sep = "_"))) %>% 
+    filter(TRB_CDR3 %in% clones.toplot$TRB_CDR3)
+
+
+
+# creat a new seuarat object with only the clones we want 
+so.clones <- subset(so, cells = rownames(barcodes))
+
+# add metadata for clone and mouse info 
+so.clones@meta.data$clone.mouse <- paste(so.clones$Group, so.clones$TRB_aa, so.clones$Rep)
+
+Idents(so.clones) <- factor(so.clones$clone.mouse, 
+                            levels = so.clones$clone.mouse %>% unique() %>% sort())
+
+DimPlot(so.clones)
+
+DotPlot(so.clones, assay = "RNA", features = c("Klrg1","Gzmb","Cxcr3","Ltb","Pdcd1", "Tox"))$data %>% 
+  ggplot(aes(y = id, x =features.plot, size = pct.exp, color = avg.exp.scaled)) + 
+  geom_point() +
+  plot.theme +
+  coord_flip() + rotate_x_text(90) + 
+  scale_color_viridis(option = "magma")# +
+  theme(axis.text.x = element_blank()) 
+
+# ggsave("3H - dotplot of same clones in dif hosts.pdf", width = 10, height = 2.5, path = outs)
+
+```
+

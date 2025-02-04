@@ -1,0 +1,330 @@
+# load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(viridis)
+  library(ComplexHeatmap)
+  library(cowplot)
+  library(RColorBrewer)
+  library(ggpubr)
+  library(immunarch)
+})
+```
+
+# plot aesthetics
+```{r}
+pop.pal <-  c(
+  "Tcm" = "#65c7ca", 
+  "Tem_1" = "#f8a523" ,
+  "Tem_2" = "#f6d13a", 
+  "Tex-Term" = "#b31e0e", 
+  "Tex-Prog" = "#a94d9a"
+  )
+
+clusterpal <-  c(
+  "Tcm Bias" = "#65C7CA",
+  "Tex-Prog Bias" = "#A94D9A",
+  "Divergent" = "#e6af7c",
+  "Tem_1 Bias" = "#f8a523" ,
+  "Tem_2 Bias" = "#f6d13a", 
+  "Tex-Term Bias" = "#b31e0e")
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"), 
+                                      strip.background = element_rect(fill = "transparent"), strip.text = element_text(size = 14),)
+
+```
+
+# data import and filtering only in frame TCRs
+```{r}
+# filepaths
+path <- '/Users/craposo/Desktop/Github Upload/3_TCRseq100dpi/data'
+files <- list.files(path, pattern = "\\.tsv$")
+
+# create list of all data
+tcr_data <- lapply(files, function(filename) {
+  read_tsv(paste(path, filename, sep = "/"),) %>% #as.data.frame() %>%
+  return()
+})
+
+# combine entire list into a single dataframe
+tcr_data <- do.call(rbind, tcr_data)
+head(tcr_data)
+
+# clean tcr data -> only in frame TCRs
+tcr_clean <- tcr_data %>% 
+  subset(frame_type == "In") %>%
+  select(c("sample_name" ,"rearrangement", "amino_acid" ,"templates"))
+
+colnames(tcr_clean) <- c("SampleID","NucleotideSeq","AminoAcidSeq","Count")
+
+# append sample info
+metadata <- read_excel(path = "/Users/craposo/Library/CloudStorage/Box-Box/Colin Raposo's Files/Satpathy Lab Rotation/Experiments/CR43 - Longitudinal bTCR Cl13/CR43_samples.xlsx") 
+colnames(metadata) <- c("Group","Tet","Pop","SampleName","SampleID","TotalSortedCells", "Percent of Tet" , "Adj Cell Number", "productive_reads", "Read per Cell" , "Mult_Factor")
+
+# merge metadata and the reads
+tcr.df <- merge(tcr_clean, metadata, by = "SampleID")
+
+# normalize read count based on multiplication factor (ratio of reads to cells - calculated in excel to determine)
+## Norm_count is is the total number of cells in a clone
+tcr.df$Norm_Count <- tcr.df$Mult_Factor * tcr.df$Count
+
+```
+
+# cluster clones by kmeans clustering 
+```{r}
+# isoalte only spleen d100 clones 
+tcr.df <- filter(tcr.df, Tet == "GP33", Group == "SPL")
+
+# fetch counts per clone per population
+hm.df <- tcr.df %>% 
+  select(NucleotideSeq, Pop, Count, Norm_Count, Tet) %>%
+  # change popualtion names from original names to reflect new names
+  mutate(Pop = ifelse(Pop == "Tex-KLR", "Tem_1", Pop)) %>% mutate(Pop = ifelse(Pop == "Tex-Int", "Tem_2", Pop))  
+
+# get dataframe of expanded cllones and their clone size
+exp.clones <- hm.df %>% group_by(NucleotideSeq, Tet) %>% mutate(CloneSize = sum(Count), Norm_Count = sum(Norm_Count)) %>% 
+  select(NucleotideSeq, CloneSize, Norm_Count) %>% 
+  filter(CloneSize > 4) %>%   
+  group_by(Tet, NucleotideSeq) %>% summarise(CloneSize = mean(CloneSize), Norm_Count = mean(Norm_Count))
+
+hm.df$CloneSize %>% median()
+
+# filter by exmpanded clones
+hm.df <- filter(hm.df, NucleotideSeq %in% exp.clones$NucleotideSeq)
+
+hm.df <- hm.df %>% ungroup() %>% group_by(NucleotideSeq, Tet) %>% mutate(Prop = Norm_Count / sum(Norm_Count)) %>% 
+  select(-Norm_Count) %>% pivot_wider(id_cols = c(NucleotideSeq, Tet), values_from = Prop, names_from = Pop)
+
+hm.df[is.na(hm.df)] <- 0
+
+# add in clone size
+hm.df <- merge(select(ungroup(hm.df) , -Tet), exp.clones, by = "NucleotideSeq") # remove tet from one so we dont get a duplicate
+
+# cluster clones based on clone proportions
+set.seed(22)
+clusters <- kmeans(hm.df[, c(2:6)], centers = 6)
+hm.df$Clone_Behavior <- clusters$cluster
+
+# rename clusters
+hm.df$Clone_Behavior[hm.df$Clone_Behavior == "1"] <- "Tex-Term Bias"
+hm.df$Clone_Behavior[hm.df$Clone_Behavior == "2"] <- "Tem_2 Bias"
+hm.df$Clone_Behavior[hm.df$Clone_Behavior == "3"] <- "Tem_1 Bias"
+hm.df$Clone_Behavior[hm.df$Clone_Behavior == "4"] <- "Divergent"
+hm.df$Clone_Behavior[hm.df$Clone_Behavior == "5"] <- "Tex-Prog Bias"
+hm.df$Clone_Behavior[hm.df$Clone_Behavior == "6"] <- "Tcm Bias"
+
+
+# plot heatmap 
+
+sort.annot <- columnAnnotation(` ` = colnames(hm.df[, c(2:6)]), col = list(` ` = pop.pal), show_legend = F, annotation_height = unit(1, "cm"))
+size.annot <- rowAnnotation(` ` = anno_barplot(baseline = "min" , log2(hm.df$Norm_Count / sum(hm.df$Norm_Count))))
+
+hm.prop <- hm.df[, c(2:6)] %>% 
+     Heatmap(col = brewer.pal(9, "Purples"), 
+            right_annotation = size.annot, top_annotation = sort.annot,
+            show_row_dend = F, show_column_dend = T, border = T, 
+            name = "Frac of Clone" , show_column_names = T,
+            row_split = hm.df$Clone_Behavior, row_title_rot = 0, 
+            column_title = "TCR-seq of GP33+ Subsets",
+            height = unit(6, "cm"), width = unit(3.4, "cm"), column_dend_height = unit(0.2, "cm")
+            
+            )
+
+hm.prop
+
+
+clone.behaviors.wide <- hm.df
+clone.behaviors.wide %>% count(Clone_Behavior)
+
+```
+# hypergeometric test - determine clonal bias of a given clone for the max phenotype within that clone 
+```{r}
+# from fig 3c of DARLIN paper https://www.sciencedirect.com/science/article/pii/S0092867423010401?via%3Dihub#fig2
+
+# Function to calculate fate bias significance
+calculate_fate_bias_significance <- function(M, m, N, n) {
+  # Perform one-sided hypergeometric test
+  p_value <- phyper(m - 1, n, N - n, M, lower.tail = FALSE)
+  # Example usage:
+  # M: total cells in differentiated states for this clone
+  # m: cells in the fate cluster of interest for this clone
+  # N: total cells in differentiated states across all clones
+  # n: total cells in the fate cluster of interest across all clones
+  return(p_value)
+}
+
+
+# get data from each clone - add proper values for M m N n
+bias.df <- tcr.df %>% 
+  select(NucleotideSeq, Pop, Norm_Count) %>%
+  mutate(Pop = ifelse(Pop == "Tex-KLR", "Tem_1", Pop)) %>% mutate(Pop = ifelse(Pop == "Tex-Int", "Tem_2", Pop)) %>% #change sort names to newer IDs
+  group_by(Pop) %>% mutate(Total_Count_Sort = sum(Norm_Count)) %>% ungroup() %>% # add total cells per sort across clones (n)
+  group_by(NucleotideSeq) %>% mutate(Total_Count_Clone = sum(Norm_Count))  %>% ungroup() %>% # add total cells per clone (M)
+  mutate(Total_Count_Total = sum(Norm_Count))  %>% # add the total number of cells (N)
+  merge(select(clone.behaviors.wide, NucleotideSeq, Clone_Behavior)) 
+
+head(bias.df)
+
+# mutate values to have the correct labels to match the function
+bias.df <- bias.df %>% select(NucleotideSeq, Clone_Behavior, Pop, Norm_Count, Total_Count_Total, Total_Count_Clone, Total_Count_Sort) %>% 
+  dplyr::rename(N = Total_Count_Total, M = Total_Count_Clone, n = Total_Count_Sort, m = Norm_Count)
+
+# calulte one-sided hypergeometric test
+bias.df$p_value <- mapply(calculate_fate_bias_significance, bias.df$M, bias.df$m, bias.df$N, bias.df$n)
+
+# compare hypergeometric enrichment to clone proportion
+bias.wide <- bias.df %>% 
+  mutate(p_value = - log10(p_value)) %>% mutate(p_value = ifelse(p_value>10, 10, p_value)) %>%
+  pivot_wider(names_from = Pop, values_from = p_value, id_cols = c(NucleotideSeq, Clone_Behavior))
+bias.wide[is.na(bias.wide)] <- 1
+hm.bias <- bias.wide %>% ungroup %>% 
+  select(-c(Clone_Behavior, NucleotideSeq)) %>% 
+  Heatmap(split = bias.wide$Clone_Behavior, 
+          show_row_dend = F, row_title_rot = 0, border = T, name = "-log10(p val)", 
+          col = viridis(9)
+          )
+
+hm.prop + hm.bias
+
+# select each clones max phenotype P vlaue and adjust 
+bias.df.clonemax <- bias.df %>% group_by(NucleotideSeq) %>% slice_max(order_by = m, n = 1) 
+bias.df.clonemax$p_value_adj <-  p.adjust(bias.df.clonemax$p_value , method = "hochberg")
+
+# for paper plot clonemax
+bias.df.clonemax %>%
+  mutate(sig = ifelse(p_value_adj < 0.05, "sig", "ns")) %>% 
+  ungroup() %>%
+  count(Clone_Behavior, sig) %>% 
+  group_by(Clone_Behavior) %>%
+  mutate(freq = n/sum(n)) %>% 
+  filter(sig == "sig") %>% 
+  ggplot(aes(x = fct_reorder(Clone_Behavior,-freq), y = freq , fill = Clone_Behavior)) + 
+  geom_col(show.legend = F)   + 
+  scale_fill_manual(values = clusterpal) + 
+  plot.theme + 
+  scale_y_continuous(expand = expansion(mult = c(0.0, 0.1))) + 
+  labs(title = "Clonal Fate Bias", y = "Fraction of Clones P < 0.05", x = "Clone Behavior") + 
+  rotate_x_text(90)
+ 
+
+ bias.df.clonemax %>%
+  mutate(sig = ifelse(p_value_adj < 0.05, "sig", "ns")) %>% 
+  ungroup() %>%
+  count(Clone_Behavior, sig) %>% 
+  group_by(Clone_Behavior) %>%
+  mutate(freq = n/sum(n)) %>% 
+  filter(sig == "sig") 
+
+
+
+```
+
+# moristia horn overlap index betweem samples
+```{r}
+
+# mortisita horn overlap 
+overlap.df <- tcr.df %>%
+  mutate(Pop = ifelse(Pop == "Tex-KLR", "Tem_1", Pop)) %>% mutate(Pop = ifelse(Pop == "Tex-Int", "Tem_2", Pop)) %>%
+  select("NucleotideSeq" ,  "Count" , "Pop") 
+colnames(overlap.df) <- c("CDR3.nt" , "Clones" , "Pop")
+
+#s split by sort
+reps <- overlap.df %>% split(overlap.df$Pop)
+
+# calc overalps
+m <- repOverlap(reps, .verbose = FALSE, "morisita" , .col = "nt")
+
+# plot
+m %>% Heatmap(name = "Morisita Horn",  
+                col = brewer.pal(9, "YlOrRd"), na_col = "white",
+                border = T, 
+                width = unit(0.7*5, "cm"), height = unit(0.7*5, "cm"), 
+                show_row_dend = T, show_column_dend = T, row_dend_width = unit(0.2, "cm"), column_dend_height = unit(0.2, "cm"))
+
+
+```
+
+# determine if clones in certain behaviors are detected in blood 28 dpi
+```{r}
+# Specify the directory path and get all files in the directory
+bTCR_datapath <- path
+
+# samples 11:12 are the day 28 blood data
+#we originally split by KLRG1+ and KLRG1-, but for the puporses of this experiment, we're only looking at if clones are detected in the blood or nor
+samples <- c("TCRgp33_Processed_bulkTCRseq_GP33posCR43_11.tsv", "TCRgp33_Processed_bulkTCRseq_GP33posCR43_12.tsv")
+
+# read in samples 
+tcr_data_d28 <- lapply(samples, function(filename) {
+  read_tsv(paste(bTCR_datapath, filename, sep = "/"),) %>% #as.data.frame() %>%
+  return()
+})
+
+# rbind list into a single dataframe
+tcr_data_d28 <- do.call(rbind, tcr_data_d28)
+
+# clean tcr data -> only in frame TCRs
+tcr_data_d28 <- tcr_data_d28 %>% 
+  subset(frame_type == "In") %>%
+  select(c("sample_name" ,"rearrangement", "amino_acid" ,"templates"))
+
+
+colnames(tcr_data_d28) <- c("SampleID","NucleotideSeq","AminoAcidSeq","Count")
+
+# counts from each behavior detected
+clone.behaviors.wide %>% mutate(d28 = ifelse(NucleotideSeq %in% tcr_data_d28$NucleotideSeq, "Detected", "ND")) %>% ungroup() %>%
+  dplyr::count(Clone_Behavior, d28)
+
+# fraction of each clonal behavior detected at day 28
+clone.behaviors.wide %>% mutate(d28 = ifelse(NucleotideSeq %in% tcr_data_d28$NucleotideSeq, "Detected", "ND")) %>% ungroup() %>%
+  dplyr::count(Clone_Behavior, d28) %>% group_by(Clone_Behavior) %>%
+  mutate(n = n/sum(n)) %>% 
+  filter(d28 == "Detected") %>%
+  ggplot(aes(x = fct_reorder(Clone_Behavior, n), y = n*100 , fill = Clone_Behavior)) + 
+    geom_col(show.legend = F) +
+    plot.theme +
+    scale_y_continuous(expand = expansion(mult = c(0.0, 0.05))) + 
+    labs(x = "Clone Behavior 100+ dpi", y = "% Detected in Blood 28 dpi")
+
+
+# non-linear regession to predict if a clone will be detected in blood at 28dpi =======================================
+
+# Modify data to fit with the regression model
+regress.df <- clone.behaviors.wide %>% 
+  mutate(d28 = ifelse(NucleotideSeq %in% tcr_data_d28$NucleotideSeq, 1, 0)) %>%  # 1 is detected, 0 is ND
+  select(c(NucleotideSeq, Clone_Behavior, CloneSize, d28))
+
+# Run logistic regression model with Clone_Behavior as the predictor
+model <- glm(d28 ~ Clone_Behavior, data = regress.df, family = binomial)
+summary(model)
+
+# Create new data frame with unique values of Clone_Behavior and Generate predictions based on Clone_Behavior
+new_data <- data.frame(Clone_Behavior = unique(regress.df$Clone_Behavior)) 
+predictions <- predict(model, new_data, type = "response", se.fit = TRUE)
+
+# Store predictions and standard errors in the new data frame
+new_data$fit <- predictions$fit
+new_data$se.fit <- predictions$se.fit
+
+# Calculate maximum y-value for plotting (95% confidence interval)
+max_y <- max(new_data$fit + 1.96 * new_data$se.fit, na.rm = TRUE)
+
+
+# plot comparisons
+ggplot(data = new_data, aes(x = fct_reorder(Clone_Behavior, fit), y = fit, color = Clone_Behavior)) +
+ geom_point(size = 2.5) + 
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey80") +
+  geom_errorbar(aes(ymin = fit - 1.96 * se.fit, ymax = fit + 1.96 * se.fit, width = 0.2), width = 0.25) + # 95% confidence interval
+  plot.theme +
+  ylim(NA, max_y * 1.4) +
+  ylab("Predicted Probability of Detection 28 dpi") +
+  xlab("Behavior 100+ dpi") +
+  theme(legend.position = "none") + coord_flip() + 
+  scale_y_continuous(limits = c(0,1.01)) +
+  scale_color_manual(values = clusterpal)
+
+
+
+```
+```
+

@@ -1,0 +1,210 @@
+# as validation for clone tracing, we looked at fate distributions of clones in spleen vs. in the blood 
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse) 
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(ggridges)
+  library(data.table)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  library(MetBrewer)
+  library(cowplot)
+  library(readxl)
+})
+
+path <- '/Users/craposo/Desktop/Github Upload/4_BloodVersusSpleen/data'
+
+```   
+
+# plot aesthetics
+```{r}
+pop.pal <-  c(
+  "Tex-KLR" = "#E27E73" ,
+  "Tex-Int" = "#de311e", 
+  "Tex-Term" = "#b31e0e", 
+  "Tex-Prog" = "#a94d9a", 
+  "Tex-Prog CD62L+" = "#9EA0D0",
+  "SPL_Tex-KLR" = "#E27E73" ,
+  "SPL_Tex-Int" = "#de311e", 
+  "SPL_Tex-Term" = "#b31e0e", 
+  "SPL_Tex-Prog" = "#a94d9a", 
+  "SPL_Tex-Prog CD62L+" = "#9EA0D0",
+  "PB_Tex-KLR" = "#E27E73" ,
+  "PB_Tex-Int" = "#de311e", 
+  "PB_Tex-Prog" = "#a94d9a"
+  )
+
+
+plot.theme <- theme_cowplot() + theme(plot.title = element_text(hjust = 0.5, face = "plain"), 
+                                      strip.background = element_rect(fill = "transparent"), strip.text = element_text(size = 14)
+                                      )
+```
+
+
+```{r}
+# Specify the directory path and get all files in the directory
+bTCR_datapath <- paste0(path, "/rawdata")
+samples <- list.files(bTCR_datapath)
+
+# read in samples 
+tcr_data <- lapply(samples, function(filename) {
+  read_tsv(paste(bTCR_datapath, filename, sep = "/"),) %>% #as.data.frame() %>%
+  return()
+})
+
+# rbind list into a single dataframe
+tcr_data <- do.call(rbind, tcr_data)
+
+tcr_data
+
+# clean tcr data -> only in frame TCRs
+tcr_clean <- tcr_data %>% 
+  subset(frame_type == "In") %>%
+  select(c("sample_name" ,"rearrangement", "amino_acid" ,"templates"))
+
+colnames(tcr_clean) <- c("SampleID","NucleotideSeq","AminoAcidSeq","Count")
+
+
+# read in sample IDs and append to tcr_clean
+tcr_clean <- read_xlsx(paste0(path, "/SampleIDs.xlsx")) %>%
+  right_join(tcr_clean, by = "SampleID")
+
+# check # of TCRs per sample
+tcr_clean$SampleName %>% table
+
+# add cell #s based on % of total cells in sample and # of cells calculated by counting beads
+tcr_clean <- read_xlsx(paste0(path, "/CellNumbers.xlsx")) %>%
+  select(SampleName, TotalCount) %>% merge(tcr_clean) %>% 
+  group_by(SampleName) %>% group_by(SampleName) %>% mutate(ReadFrac = Count/sum(Count)) %>%
+  mutate(Count = ReadFrac*TotalCount)
+
+# change cell ID of Tpex
+tcr_clean$SampleName[tcr_clean$SampleName == "SPL_Tex-SL"] <- "SPL_Tex-Prog CD62L+"
+tcr_clean$Pop[tcr_clean$SampleName == "SPL_Tex-SL"] <- "Tex-Prog CD62L+"
+
+# Clone Sharing across sorts
+m <- split(tcr_clean$NucleotideSeq, tcr_clean$SampleName) %>% 
+  make_comb_mat() 
+
+m %>% UpSet(top_annotation = upset_top_annotation(m, add_numbers = T), height = unit(6, "cm"),width = unit(16, "cm"))
+
+# add total clone size of each clone
+tcr_clean <- tcr_clean %>% ungroup %>% group_by(NucleotideSeq, Organ) %>% 
+  summarise(CloneSize = sum(Count)) %>% merge(tcr_clean, by = c("NucleotideSeq", "Organ"))
+
+# look at total distribution of clone sizes
+tcr_clean %>% ggplot(aes(x = CloneSize)) + geom_histogram() + scale_x_log10() + facet_wrap(~Organ)
+
+```
+
+# clone sharing blood and spleen
+```{r}
+# clone sharing across organs
+m <- split(tcr_clean$NucleotideSeq, tcr_clean$Organ) %>% 
+  make_comb_mat() 
+
+upset <- m %>% UpSet(top_annotation = upset_top_annotation(m, add_numbers = T), height = unit(1, "cm"),width = unit(2, "cm"))
+upset
+
+# correlation of clone sizes between organs
+tcr_clean %>% select(NucleotideSeq, CloneSize, Organ) %>% group_by(NucleotideSeq, Organ) %>% summarise(CloneSize = first(CloneSize)) %>% 
+  ungroup() %>% group_by(Organ) %>% mutate(CloneFreq = CloneSize/sum(CloneSize)) %>% select(-CloneSize) %>%
+  pivot_wider(names_from = Organ, values_from = CloneFreq) %>% 
+  ggplot(aes(x = SPL, y = PB)) + 
+      geom_smooth(method = "lm", fill = "grey80", color = "grey60", linetype = "dashed") + 
+      geom_point(size = 2, color = "black", alpha = 0.5) + 
+      stat_cor() + 
+      plot.theme + 
+      scale_y_log10() + scale_x_log10() +
+      labs(x = "Clone Freqency (Spleen)", y = "Clone Freqency (Blood)")
+```
+
+# phenotype distribution of shared clones
+```{r}
+# define clones to analyze as only those expanded > 10 cells in blood and SPL
+pb.clones <- tcr_clean %>% filter(Organ == "PB", CloneSize > 10)
+spl.clones <- tcr_clean %>% filter(Organ == "SPL", CloneSize > 10)
+
+shared.clones <- intersect(pb.clones$NucleotideSeq, spl.clones$NucleotideSeq)
+
+hm.df <- tcr_clean %>% filter(NucleotideSeq %in% shared.clones) %>% 
+  select(SampleName, Count, NucleotideSeq, Organ) %>% 
+  group_by(NucleotideSeq, Organ) %>% mutate(Count = Count / sum(Count)) %>% 
+  ungroup %>%  select(-Organ) %>%
+  pivot_wider(values_from = Count, names_from = SampleName) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) %>% 
+  ungroup %>%  select(-NucleotideSeq) 
+
+annnot.df <- colnames(hm.df) %>% data.frame() %>% separate(col = "." , sep = "_", into = c("Group", "Sort"))
+
+top.annot <- columnAnnotation("Sort" = annnot.df$Sort, #"Organ" = annnot.df$Group, 
+                              col = list("Sort" = pop.pal#, "Organ" = organ.pal
+                                         ))
+
+hm <- hm.df %>% 
+  Heatmap(col = brewer.pal(9, "Purples"), 
+            top_annotation = top.annot,
+            show_row_dend = F, show_column_dend = T, border = T, column_dend_height = unit(0.2, "cm"),
+            name = "Frac of Clone" , show_column_names = T,
+            height = unit(5, "cm"),
+            width = unit(8*0.6, "cm"),
+            column_title_side = "top",
+            column_split = annnot.df$Group
+  )
+
+hm
+
+```
+# Coreelation of phenotype distribution in different organs
+```{r}
+library(Hmisc) # for improved correlation with p values
+
+cor.results <- hm.df %>% as.matrix() %>% rcorr()
+
+# determine significance
+# create new matrix in which to summarize p values
+sig_matrix <- matrix(" " , nrow = nrow(cor.results$r), ncol = ncol(cor.results$r))
+colnames(sig_matrix) <- colnames(cor.results$r)
+rownames(sig_matrix) <- rownames(cor.results$r)
+
+# sumamrize bonferoni corrected pvalues
+sig_matrix[cor.results$P <=  0.05 / cor.results$r %>% length()] <- "*"
+sig_matrix[cor.results$P <=  0.01 / cor.results$r %>% length()] <- "**" 
+sig_matrix[cor.results$P <=  0.001 / cor.results$r %>% length()] <- "***"
+
+# plot all correlations
+cor.results$r %>% Heatmap(col =  brewer.pal(9, "Reds"), #viridis(9) , 
+                      na_col = "white", border = T, 
+                      width = unit(8*0.7, "cm"), height = unit(8*0.7, "cm"), name = "Pearson R", 
+                      cluster_rows = T, cluster_columns = T,
+                      show_row_dend = T, show_column_dend = T, column_dend_height = unit(0.2, "cm"), row_dend_width = unit(0.2, "cm"), row_dend_side = "right",
+                      row_title_side = "left", column_title_side = "bottom", row_names_side = "left",
+                      cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sig_matrix[i, j], x, y, gp = gpar(fontsize = 14, col = "white"))},
+                  )
+
+
+cor.results
+
+# plotonly spleen versus blood correlation 
+column.annot <- columnAnnotation(" " = colnames(cor.results$r[c(1,4,5), c(2,3,6,7,8)]), col = list(" " = pop.pal), show_legend = F)
+row.annot <- rowAnnotation(" " = rownames(cor.results$r[c(1,4,5), c(2,3,6,7,8)]), col = list(" " = pop.pal), show_legend = F)
+
+pop.pal
+
+cor.results$r[c(1,4,5), c(2,3,6,7,8)] %>% Heatmap(
+                      col = viridis(9) , 
+                      na_col = "white", border = T, 
+                      width = unit(5*.9, "cm"), height = unit(3*0.9 , "cm"), name = "Pearson R", 
+                      cluster_rows = T, cluster_columns = T,
+                      show_row_dend = F, show_column_dend = F, 
+                      top_annotation = column.annot, right_annotation = row.annot,
+                      row_title = "Blood Subset" , column_title = "Spleen Subset" ,
+                      row_title_side = "left", column_title_side = "bottom", row_names_side = "left",
+                      cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sig_matrix[1:3, 4:8][i, j], x, y, gp = gpar(fontsize = 14, col = "white"))},
+                  )
+
+
+```
+
