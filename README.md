@@ -1,5 +1,5 @@
 ## Functional Memory Cells are Derived from Tex Clones
-This Repository contains R markdown files needed to generate all figures for our manuscript **Functional memory T cells are derived from exhausted clones and expanded by checkpoint blockade**. We have also included most processed data needed to generate figures. However, due to GitHub size restrictions, we have uploaded fully processed (filtered, demultiplexed, and clustered) Seurat Objects on [Zenodo](https://doi.org/10.5281/zenodo.14803877). 
+This Repository contains R markdown files needed to generate all figures for our manuscript **Functional memory T cells are derived from exhausted clones and expanded by checkpoint blockade**. We have also included most processed data needed to generate figures. However, due to size restrictions, fully processed (filtered, demultiplexed, and clustered) Seurat Objects are uploaded to [Zenodo](https://doi.org/10.5281/zenodo.14803877). 
 
 Raw single cell and ATAC-seq data are on NCBI GEO at accession numbers [GSE285411](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE241471) (scRNA/TCR-seq atlas), [GSE285412](https://www.ncbi.xyz/geo/query/acc.cgi?acc=GSE285412) (scRNA/TCR-seq αPD-L1), [GSE285414](https://www.ncbi.xyz/geo/query/acc.cgi?acc=GSE285414) (scRNA/TCR-seq post-rechallenge) and GSE285308 (ATAC-seq). Bulk TCR-seq data are available on [Zenodo](https://doi.org/10.5281/zenodo.14648171). This repository was created and is maintained by Colin Raposo, who takes responsibility for its contents.
 
@@ -8,6 +8,7 @@ Immune checkpoint blockade can facilitate tumor clearance by T cells, resulting 
 
 ## Directories
 Each directory in this repository contains processed data and R markdown files to generate figures for a given set of experiments. We have also included knitted .html documents for most analysis.
+
 ***1 - scRNA/TCR-seq atlas*** 
 Analysis of scRNA/TCR-seq of GP33+ cells (+/- CD62L enrichment): **Fig. 1,2** and **Extended Data Fig. 1,3,4**
 
